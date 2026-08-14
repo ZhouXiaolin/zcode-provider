@@ -96,8 +96,10 @@ function resolveModelRef(id: string): { providerId: string; modelId: string } {
 }
 
 // The app-server resolves models only from its settings file, but the ZCode UI
-// writes providers to the v2 config; merge v2 providers in (additive) so
-// anything configured in ZCode reaches the server. Called before spawn and on
+// writes providers to the v2 config; upsert enabled v2 providers into the
+// settings file so anything configured in ZCode reaches the server (v2 is
+// authoritative for providers/models, including model additions/removals inside
+// existing providers). Called at extension load, before spawn, and on
 // config-file changes; the server re-reads the settings file live, so no
 // restart is needed for newly merged providers.
 function mergeV2Providers(): string[] {
@@ -108,25 +110,25 @@ function mergeV2Providers(): string[] {
     const cli = JSON.parse(readFileSync(SETTINGS_PATH, "utf8")) as {
       provider?: Record<string, unknown>;
     };
-    const added: string[] = [];
+    const changed: string[] = [];
     for (const [pid, p] of Object.entries(v2.provider ?? {})) {
       // Skip disabled entries: the app-server catalog rejects them at load
       // ("Model config is missing"), and the user did not enable them anyway.
       if ((p as { enabled?: boolean }).enabled === false) continue;
-      if (!(pid in (cli.provider ?? {}))) {
+      if (JSON.stringify(cli.provider?.[pid]) !== JSON.stringify(p)) {
         cli.provider ??= {};
         cli.provider[pid] = p;
-        added.push(pid);
+        changed.push(pid);
       }
     }
-    if (added.length) {
+    if (changed.length) {
       copyFileSync(
         SETTINGS_PATH,
         `${SETTINGS_PATH}.bak-${new Date().toISOString().replace(/[:.]/g, "-")}`,
       );
       writeFileSync(SETTINGS_PATH, JSON.stringify(cli, null, 2) + "\n");
     }
-    return added;
+    return changed;
   } catch {
     return [];
   }
@@ -378,6 +380,7 @@ function toPiModels(catalog: CatalogModel[]) {
 }
 
 export default function (pi: ExtensionAPI) {
+  mergeV2Providers();
   pi.registerProvider("zcode", {
     name: "ZCode (app-server)",
     baseUrl: "zcode://app-server",

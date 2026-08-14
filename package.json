@@ -1,12 +1,22 @@
 {
   "name": "zcode-provider",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Use the ZCode agent (zcodex app-server) as a pi model provider: pi is the chat frontend, ZCode runs the model and its own tools (bash, edits, session memory).",
-  "keywords": ["pi-package", "pi-extension", "zcode", "opencode", "agent"],
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "zcode",
+    "opencode",
+    "agent"
+  ],
   "license": "MIT",
   "type": "module",
   "private": false,
-  "files": ["extensions", "README.md", "LICENSE"],
+  "files": [
+    "extensions",
+    "README.md",
+    "LICENSE"
+  ],
   "repository": {
     "type": "git",
     "url": "git+https://github.com/ZhouXiaolin/zcode-provider.git"
@@ -20,6 +30,8 @@
     "@earendil-works/pi-coding-agent": "*"
   },
   "pi": {
-    "extensions": ["./extensions"]
+    "extensions": [
+      "./extensions"
+    ]
   }
 }
