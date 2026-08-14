@@ -13,8 +13,14 @@
 // Auto-sync: providers configured in the ZCode v2 config (default
 // ~/.zcode/v2/config.json; override ZCODE_V2_CONFIG) are merged into the
 // settings file at server spawn and on config-file changes (the app-server
-// re-reads its settings file live). pi re-reads the catalog on every /model
-// open via refreshModels, so new providers/models show up without a reload.
+// re-reads its settings file live). The app-server also validates the settings
+// file against a strict schema that REQUIRES a top-level `model` (a
+// "provider/model" ref) and refuses to run a turn with "Model config is
+// missing" when it is absent or invalid, so the settings file is bootstrapped
+// with a valid default too (existing ref kept, else v2's model selection,
+// else the first enabled provider's first model). pi re-reads the catalog on
+// every /model open via refreshModels, so new providers/models show up without
+// a reload.
 //
 // Wire protocol (ZCode Protocol v1, NDJSON over stdio), verified live:
 //   request:       {"id": N, "method": "...", "params": {...}}
@@ -96,6 +102,47 @@ function resolveModelRef(id: string): { providerId: string; modelId: string } {
   throw new Error(`provider name ${head} is ambiguous in ${SETTINGS_PATH}`);
 }
 
+interface SettingsProvider {
+  enabled?: boolean;
+  models?: Record<string, unknown>;
+}
+interface SettingsConfig {
+  model?: unknown;
+  provider?: Record<string, SettingsProvider>;
+}
+
+// Matches the app-server's model-ref format check (aGr in zcode.cjs): a string
+// containing a "/" with non-empty text on both sides, i.e. "provider/model".
+function isModelRef(v: unknown): v is string {
+  if (typeof v !== "string") return false;
+  const t = v.indexOf("/");
+  return t > 0 && t < v.length - 1;
+}
+
+// Extract the "provider/model" ref from either config form the app-server
+// accepts: a bare string, or the { main: string } (lite allowed) object form.
+function modelRefOf(v: unknown): string | null {
+  if (isModelRef(v)) return v;
+  if (v && typeof v === "object" && !Array.isArray(v)) {
+    const main = (v as { main?: unknown }).main;
+    if (isModelRef(main)) return main;
+  }
+  return null;
+}
+
+// First enabled provider that has models -> "provider/model" of its first
+// model, or null when there are no usable providers.
+function firstModelRef(
+  providers: Record<string, SettingsProvider> | undefined,
+): string | null {
+  for (const [pid, p] of Object.entries(providers ?? {})) {
+    if (p.enabled === false) continue;
+    const modelId = Object.keys(p.models ?? {})[0];
+    if (modelId) return `${pid}/${modelId}`;
+  }
+  return null;
+}
+
 // The app-server resolves models only from its settings file, but the ZCode UI
 // writes providers to the v2 config; upsert enabled v2 providers into the
 // settings file so anything configured in ZCode reaches the server (v2 is
@@ -103,13 +150,25 @@ function resolveModelRef(id: string): { providerId: string; modelId: string } {
 // existing providers). Called at extension load, before spawn, and on
 // config-file changes; the server re-reads the settings file live, so no
 // restart is needed for newly merged providers.
+//
+// Also bootstraps the required top-level `model` ref: keep an existing valid
+// ref (the app-server persists session/setModel choices back here), else fall
+// back to v2's model selection, else the first enabled provider's first model.
 function mergeV2Providers(): string[] {
+  let cli: SettingsConfig = { provider: {} };
+  try {
+    cli = JSON.parse(readFileSync(SETTINGS_PATH, "utf8")) as SettingsConfig;
+  } catch (err) {
+    // Missing settings file -> bootstrap below. Unreadable/broken file -> leave
+    // it alone (overwriting would silently drop the user's mcp/plugins config).
+    if (!(err instanceof Error) || (err as NodeJS.ErrnoException).code !== "ENOENT") {
+      return [];
+    }
+  }
   try {
     const v2 = JSON.parse(readFileSync(V2_CONFIG_PATH, "utf8")) as {
       provider?: Record<string, unknown>;
-    };
-    const cli = JSON.parse(readFileSync(SETTINGS_PATH, "utf8")) as {
-      provider?: Record<string, unknown>;
+      model?: unknown;
     };
     const changed: string[] = [];
     for (const [pid, p] of Object.entries(v2.provider ?? {})) {
@@ -122,11 +181,31 @@ function mergeV2Providers(): string[] {
         changed.push(pid);
       }
     }
+    // Ensure a valid top-level `model` for the app-server's schema.
+    let ref = modelRefOf(cli.model);
+    if (ref) {
+      const pid = ref.slice(0, ref.indexOf("/"));
+      if (!(pid in (cli.provider ?? {}))) ref = null; // provider gone -> re-derive
+    }
+    if (!ref) {
+      ref = modelRefOf(v2.model);
+      if (ref) {
+        const pid = ref.slice(0, ref.indexOf("/"));
+        if (!(pid in (cli.provider ?? {}))) ref = null;
+      }
+      if (!ref) ref = firstModelRef(cli.provider);
+      if (ref && cli.model !== ref) {
+        cli.model = ref;
+        changed.push("model");
+      }
+    }
     if (changed.length) {
-      copyFileSync(
-        SETTINGS_PATH,
-        `${SETTINGS_PATH}.bak-${new Date().toISOString().replace(/[:.]/g, "-")}`,
-      );
+      if (existsSync(SETTINGS_PATH)) {
+        copyFileSync(
+          SETTINGS_PATH,
+          `${SETTINGS_PATH}.bak-${new Date().toISOString().replace(/[:.]/g, "-")}`,
+        );
+      }
       writeFileSync(SETTINGS_PATH, JSON.stringify(cli, null, 2) + "\n");
     }
     return changed;

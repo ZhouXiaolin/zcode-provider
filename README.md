@@ -40,9 +40,17 @@ ZCode's app-server resolves models only from its settings file
 1. **Merges enabled providers** from the v2 config into the settings file at
    server spawn and whenever either `config.json` changes (the app-server
    re-reads its settings file live, so newly merged providers work immediately).
-2. **Publishes the catalog to pi** via `refreshModels`, so opening `/model`
+2. **Bootstraps the settings file's `model` field.** The app-server validates
+   the settings file against a strict schema that *requires* a top-level
+   `model` — a `"provider/model"` ref — and refuses to run a turn with
+   "Model config is missing" when it is absent or invalid. The extension keeps
+   an existing valid ref (the app-server persists `session/setModel` choices
+   back to this field), else falls back to the v2 config's own model
+   selection, else the first enabled provider's first model. The settings file
+   is also created from scratch when it does not exist yet.
+3. **Publishes the catalog to pi** via `refreshModels`, so opening `/model`
    always shows the current providers/models without a reload.
-3. **Switches the ZCode session model** with `session/setModel` when you pick a
+4. **Switches the ZCode session model** with `session/setModel` when you pick a
    different pi model. The choice also persists back to ZCode's config
    (`model.main`), so the model you last used in pi is ZCode's default.
 
