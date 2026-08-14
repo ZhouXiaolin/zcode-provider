@@ -28,9 +28,10 @@
 // user-execution scopes) -> session/send {sessionId, content} -> wait for
 // state.updated reason "prompt_completed" -> session/messages -> text parts.
 //
-// Server command overridable via env ZCODE_SERVE_CMD. Permission requests are
-// auto-allowed unless ZCODE_AUTO_ALLOW=0 (the point is that the ZCode agent
-// executes tasks). Verify raw traffic with /zcode-probe.
+// Server command overridable via env ZCODE_SERVE_CMD; default resolves the
+// ZCode install for the current platform (Linux /opt, macOS /Applications).
+// Permission requests are auto-allowed unless ZCODE_AUTO_ALLOW=0 (the point is
+// that the ZCode agent executes tasks). Verify raw traffic with /zcode-probe.
 import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
 import type {
   Api,
@@ -42,7 +43,7 @@ import type {
 } from "@earendil-works/pi-ai";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { spawn, type ChildProcess } from "node:child_process";
-import { copyFileSync, readFileSync, watch, writeFileSync } from "node:fs";
+import { copyFileSync, existsSync, readFileSync, watch, writeFileSync } from "node:fs";
 import { appendFile } from "node:fs/promises";
 import { createInterface } from "node:readline";
 import { dirname } from "node:path";
@@ -153,8 +154,28 @@ function watchConfigs(): void {
   }
 }
 
-const SERVE_CMD =
-  process.env.ZCODE_SERVE_CMD ?? "node /opt/ZCode/resources/glm/zcode.cjs app-server";
+const ZCODE_CJS_PATHS = [
+  "/opt/ZCode/resources/glm/zcode.cjs", // Linux
+  "/Applications/ZCode.app/Contents/Resources/glm/zcode.cjs", // macOS
+];
+
+// Pick the install path that exists, preferring the current platform's.
+function defaultServeCmd(): string {
+  const ordered =
+    process.platform === "darwin"
+      ? [ZCODE_CJS_PATHS[1], ZCODE_CJS_PATHS[0]]
+      : ZCODE_CJS_PATHS;
+  const found = ordered.find((p) => {
+    try {
+      return existsSync(p);
+    } catch {
+      return false;
+    }
+  });
+  return `node ${found ?? (process.platform === "darwin" ? ZCODE_CJS_PATHS[1] : ZCODE_CJS_PATHS[0])} app-server`;
+}
+
+const SERVE_CMD = process.env.ZCODE_SERVE_CMD ?? defaultServeCmd();
 
 const RUNTIME_PREFS = {
   nativeSearchEnhancementsEnabled: false,

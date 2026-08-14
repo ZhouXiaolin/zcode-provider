@@ -55,7 +55,7 @@ Environment variables (set before starting pi):
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `ZCODE_SERVE_CMD` | `node /opt/ZCode/resources/glm/zcode.cjs app-server` | Command that starts the ZCode stdio app server |
+| `ZCODE_SERVE_CMD` | `node <zcode.cjs> app-server` (auto-detected: `/opt/ZCode/resources/glm/zcode.cjs` on Linux, `/Applications/ZCode.app/Contents/Resources/glm/zcode.cjs` on macOS) | Command that starts the ZCode stdio app server |
 | `ZCODE_SETTINGS` | `~/.zcode/cli/config.json` | Settings file the app-server reads models from |
 | `ZCODE_V2_CONFIG` | `~/.zcode/v2/config.json` | ZCode UI config whose enabled providers are merged in |
 | `ZCODE_AUTO_ALLOW` | `1` (enabled) | Auto-answer ZCode permission prompts. Set to `0` to deny tool permission requests |
