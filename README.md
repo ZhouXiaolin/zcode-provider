@@ -12,8 +12,12 @@ when you add or change providers.
 ## Install
 
 ```sh
+# from npm (recommended)
+pi install npm:zcode-provider
+
+# or from the GitHub repo:
 pi install git:github.com/ZhouXiaolin/zcode-provider
-# or pin a release:
+# pinned to a release:
 pi install git:github.com/ZhouXiaolin/zcode-provider@v0.1.0
 ```
 

@@ -6,6 +6,15 @@
   "license": "MIT",
   "type": "module",
   "private": false,
+  "files": ["extensions", "README.md", "LICENSE"],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ZhouXiaolin/zcode-provider.git"
+  },
+  "homepage": "https://github.com/ZhouXiaolin/zcode-provider",
+  "bugs": {
+    "url": "https://github.com/ZhouXiaolin/zcode-provider/issues"
+  },
   "peerDependencies": {
     "@earendil-works/pi-ai": "*",
     "@earendil-works/pi-coding-agent": "*"
