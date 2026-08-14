@@ -389,6 +389,14 @@ function streamSimple(
         });
         sessionId = created.session.sessionId;
         lastModelId = null;
+      } else {
+        // The app-server evicts idle sessions from memory (resident pool:
+        // idleTimeoutMs 600s by default, plus LRU over 16 sessions) and then
+        // rejects session-bound calls with "Session is not active". resume is
+        // a no-op while the session is resident and rehydrates it from the
+        // persisted store when evicted, so multi-turn continuity survives idle
+        // gaps without ever surfacing that error.
+        await request("session/resume", { sessionId });
       }
       if (lastModelId !== model.id) {
         await request("session/setModel", { sessionId, model: ref });

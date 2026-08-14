@@ -89,9 +89,15 @@ the raw protocol lines to `/tmp/zcode-probe.jsonl`.
 `zcodex app-server` speaks a private NDJSON protocol over stdio (not standard
 JSON-RPC). The bridge implements the subset:
 
-`session/create` → answer `session/requestRuntimePreferences` → `session/send` →
-wait for `state.updated` (reason `prompt_completed`) → `session/messages` →
-assistant text parts. Model switching uses `session/setModel`.
+`session/create` → answer `session/requestRuntimePreferences` → `session/resume`
+(no-op while resident, rehydrates after idle eviction) → `session/send` → wait for
+`state.updated` (reason `prompt_completed`) → `session/messages` → assistant text
+parts. Model switching uses `session/setModel`.
+
+The ZCode app-server evicts idle sessions from memory (resident pool: 10 min
+idle timeout, LRU beyond 16 sessions) and would otherwise reject stale session
+ids with "Session is not active"; the bridge resumes the persisted session
+before every turn, so multi-turn continuity survives idle gaps.
 
 ## Known limitations
 
@@ -99,6 +105,9 @@ assistant text parts. Model switching uses `session/setModel`.
   no token-level streaming on the wire.
 - pi's RPC/print mode has a model-resolver crash in some pi 0.84.2 builds that
   also affects built-in providers; interactive `/model` is unaffected.
+- The resident-pool eviction cannot be configured from outside the app-server;
+  idle recovery relies on `session/resume` (one extra round-trip only after the
+  session was evicted).
 
 ## License
 
