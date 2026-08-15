@@ -59,6 +59,14 @@ const SETTINGS_PATH =
 const V2_CONFIG_PATH =
   process.env.ZCODE_V2_CONFIG ?? `${process.env.HOME ?? "~"}/.zcode/v2/config.json`;
 
+// Per-turn budget: when a turn exceeds this, the bridge interrupts it and
+// sends the session "go on" (see streamSimple), so long tasks checkpoint
+// instead of failing. Override with ZCODE_TURN_TIMEOUT_MS.
+const TURN_TIMEOUT_MS = (() => {
+  const n = Number(process.env.ZCODE_TURN_TIMEOUT_MS);
+  return Number.isFinite(n) && n > 0 ? n : 30 * 60 * 1000;
+})();
+
 interface CatalogModel {
   id: string; // `${providerName}/${modelId}`, the pi model id
   providerId: string;
@@ -328,6 +336,13 @@ const RUNTIME_PREFS = {
   modelContextBudgetStrategy: "preflight-v1",
 };
 
+// Polling delay (Promise.withResolvers avoids the executor form).
+function delay(ms: number): Promise<void> {
+  const { promise, resolve } = Promise.withResolvers<void>();
+  setTimeout(resolve, ms);
+  return promise;
+}
+
 const pending = new Map<string, { resolve: (v: unknown) => void; reject: (e: Error) => void }>();
 let nextId = 1;
 let proc: ChildProcess | null = null;
@@ -446,8 +461,9 @@ function streamSimple(
         out.push({ type: "error", reason, error: output });
       }
     };
+    let ref: { providerId: string; modelId: string };
     try {
-      const ref = resolveModelRef(model.id);
+      ref = resolveModelRef(model.id);
       if (!sessionId) {
         const created = await request<{ session: { sessionId: string } }>("session/create", {
           workspace: { workspacePath: process.cwd(), workspaceKey: process.cwd() },
@@ -486,34 +502,66 @@ function streamSimple(
     }
 
     let settled = false;
-    const onEvent = (msg: any) => {
+    // Any turn ending (completed or failed) releases the app-server's turn
+    // lock; the checkpoint path waits for that before sending the next turn.
+    let turnSettled = false;
+    const onEvent = (msg: unknown) => {
+      if (typeof msg !== "object" || msg === null) return;
+      if (!("method" in msg) || !("params" in msg)) return;
       if (msg.method !== "state.updated") return;
-      const p = msg.params ?? {};
-      if (p.reason === "prompt_completed") settled = true;
+      const p = msg.params;
+      if (typeof p !== "object" || p === null || !("reason" in p)) return;
+      const reason = p.reason;
+      if (reason === "prompt_completed") settled = true;
+      if (reason === "prompt_completed" || reason === "prompt_failed") turnSettled = true;
     };
     listeners.add(onEvent);
     const abortHandler = () => {
       listeners.delete(onEvent);
+      clearTimeout(timer);
       void request("session/stop", { sessionId }).catch(() => {});
       finish("aborted", "aborted by user");
     };
     options?.signal?.addEventListener("abort", abortHandler, { once: true });
+    // The per-turn budget is a checkpoint, not a failure: interrupt the turn
+    // (session/stop), then send "go on" so the ZCode session resumes the task
+    // from its own history. The pi stream stays open until the task completes.
     const timer = setTimeout(() => {
-      listeners.delete(onEvent);
-      finish("error", "timeout waiting for zcode turn");
-    }, 30 * 60 * 1000);
+      if (settled || output.stopReason !== "pending") return;
+      void (async () => {
+        try {
+          turnSettled = false;
+          await request("session/stop", { sessionId });
+          // Wait until the app-server actually released the turn lock, then
+          // start the continuation; sending "go on" too early is rejected with
+          // "A prompt is already running for this session".
+          const deadline = Date.now() + 10_000;
+          while (!turnSettled && Date.now() < deadline) await delay(100);
+          if (settled) return; // turn completed right at the boundary
+          await request("session/send", {
+            sessionId,
+            content: "go on",
+            runtimeModel: runtimeModelOf(ref.providerId, ref.modelId),
+          });
+          timer.refresh?.(); // restart the budget for the continuation
+        } catch (e) {
+          listeners.delete(onEvent);
+          finish("error", e instanceof Error ? e.message : String(e));
+        }
+      })();
+    }, TURN_TIMEOUT_MS);
     timer.unref?.();
 
     while (!settled) {
       if (output.stopReason !== "pending") return; // aborted/error already finished
-      await new Promise((r) => setTimeout(r, 250));
+      await delay(250);
     }
     clearTimeout(timer);
     listeners.delete(onEvent);
 
     try {
       // Small settle delay so the final message is queryable.
-      await new Promise((r) => setTimeout(r, 500));
+      await delay(500);
       const msgs = await request<{ messages: ZcodeMessage[] }>("session/messages", { sessionId });
       const lastAssistant = [...(msgs.messages ?? [])]
         .reverse()

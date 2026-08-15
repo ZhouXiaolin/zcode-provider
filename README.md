@@ -67,6 +67,7 @@ Environment variables (set before starting pi):
 | `ZCODE_SETTINGS` | `~/.zcode/cli/config.json` | Settings file the app-server reads models from |
 | `ZCODE_V2_CONFIG` | `~/.zcode/v2/config.json` | ZCode UI config whose enabled providers are merged in |
 | `ZCODE_AUTO_ALLOW` | `1` (enabled) | Auto-answer ZCode permission prompts. Set to `0` to deny tool permission requests |
+| `ZCODE_TURN_TIMEOUT_MS` | `1800000` (30 min) | Per-turn budget. On timeout the bridge interrupts the turn (`session/stop`) and sends the session `go on`, so long tasks keep progressing instead of failing. Raise it for turns that need to run longer uninterrupted |
 
 ## Security
 
@@ -101,6 +102,11 @@ before every turn, so multi-turn continuity survives idle gaps.
 
 ## Known limitations
 
+- A turn that exceeds `ZCODE_TURN_TIMEOUT_MS` (default 30 min) is
+  checkpointed: the bridge interrupts it (`session/stop`) and sends the session
+  `go on`, so the ZCode agent continues the task with its full session history.
+  The pi stream stays open until the task completes. Stopping the turn in pi
+  aborts the server-side turn too.
 - Replies arrive as one chunk after the ZCode turn completes (tools included);
   no token-level streaming on the wire.
 - pi's RPC/print mode has a model-resolver crash in some pi 0.84.2 builds that
