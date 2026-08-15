@@ -102,6 +102,71 @@ function resolveModelRef(id: string): { providerId: string; modelId: string } {
   throw new Error(`provider name ${head} is ambiguous in ${SETTINGS_PATH}`);
 }
 
+interface SettingsModel {
+  reasoning?: { enabled?: boolean; variants?: string[]; defaultVariant?: string };
+  limit?: { context?: number; output?: number };
+}
+
+// The app-server validates a resumed session's model against its per-workspace
+// model catalog, which is populated only by workspace/updateProviderRegistry or
+// by applying a runtimeModel. The bridge sends neither, so every cold resume
+// (after the app-server's 10-min idle eviction) sets a session restoreWarning
+// (ZCODE_RUNTIME_MODEL_UNAVAILABLE, "历史任务使用的模型已不可用...") and
+// session/send refuses the turn — even for a model that is in the list. A bare
+// session/setModel does not clear the warning; only applying a runtimeModel
+// does. Build the descriptor from the settings file the app-server already
+// trusts and send it with every session/send.
+function runtimeModelOf(
+  providerId: string,
+  modelId: string,
+): Record<string, unknown> {
+  const cfg = JSON.parse(readFileSync(SETTINGS_PATH, "utf8")) as {
+    provider?: Record<
+      string,
+      {
+        name?: string;
+        kind?: string;
+        apiFormat?: string;
+        source?: string;
+        options?: { apiKey?: string; baseURL?: string; apiKeyRequired?: boolean };
+        models?: Record<string, SettingsModel>;
+      }
+    >;
+  };
+  const p = cfg.provider?.[providerId];
+  if (!p) throw new Error(`provider ${providerId} not found in ${SETTINGS_PATH}`);
+  const models = Object.entries(p.models ?? {}).map(([id, m]) => ({
+    modelId: id,
+    contextWindow: m.limit?.context,
+    maxOutputTokens: m.limit?.output,
+    ...(m.reasoning
+      ? {
+          reasoning: {
+            enabled: m.reasoning.enabled ?? true,
+            levels: (m.reasoning.variants ?? []).map((v) => ({ value: v, label: v })),
+            defaultLevel: m.reasoning.defaultVariant,
+          },
+        }
+      : {}),
+  }));
+  return {
+    revision: String(Date.now()),
+    generatedAt: Date.now(),
+    model: { providerId, modelId },
+    provider: {
+      providerId,
+      kind: p.kind ?? "openai-compatible",
+      ...(p.apiFormat ? { apiFormat: p.apiFormat } : {}),
+      label: p.name,
+      source: p.source ?? "workspace",
+      baseURL: p.options?.baseURL,
+      ...(p.options?.apiKey ? { apiKey: { source: "inline", value: p.options.apiKey } } : {}),
+      apiKeyRequired: p.options?.apiKeyRequired,
+      models,
+    },
+  };
+}
+
 interface SettingsProvider {
   enabled?: boolean;
   models?: Record<string, unknown>;
@@ -408,7 +473,13 @@ function streamSimple(
           ? last.content
           : (last?.content ?? []).map((c) => (c.type === "text" ? c.text : "")).join("");
       if (!prompt) throw new Error("no user message in context");
-      await request("session/send", { sessionId, content: prompt });
+      // runtimeModel clears the app-server's restoreWarning on cold resumes (see
+      // runtimeModelOf) and keeps the workspace model catalog populated.
+      await request("session/send", {
+        sessionId,
+        content: prompt,
+        runtimeModel: runtimeModelOf(ref.providerId, ref.modelId),
+      });
     } catch (e) {
       finish("error", e instanceof Error ? e.message : String(e));
       return;
