@@ -187,11 +187,22 @@ questions: ...").
   block → … Each tool call renders as `**🔧 Name** — summary` (one-line
   command/path summary for the common tools, fenced JSON for complex args,
   the question text for `askUserQuestion`); each result renders as a fenced
-  text block capped at 6k chars with truncation and failure markers. Bash
-  calls merge command + output into a single fenced block (`$ cmd` first line,
-  echoing pi's native bash display). A turn that ends with a bash call whose
-  result never arrived (aborted/timeout) closes the fence so every block
-  stays well-formed.
+  text block capped at 6k chars with truncation and failure markers.
+- **Results mirror pi's own tool display, not the full tool output** — the
+  full result stays inside the ZCode session (the agent's model already
+  consumed it), so the transcript only shows a readable preview:
+  - `read`-like tools (`read`/`read_file`/`view_file`): the call line shows
+    the requested range like pi's collapsed read box — `🔧 read —
+    /path:80-220` — and the result collapses to nothing (failures still show
+    the error text).
+  - `bash`: command + output are merged into one fenced block in pi's style —
+    `$ cmd`, then `... (N earlier lines)` with the **last 10 lines** of the
+    output (tail preview, like pi's bash display), closed with a `Took 0.0s`
+    duration line measured by the bridge between the call and its result.
+  - everything else: fenced text capped at 6k chars of the head, with
+    truncation and failure markers.
+  A turn that ends with a bash call whose result never arrived
+  (aborted/timeout) closes the fence so every block stays well-formed.
 - **MCP / skill / plugin tools are handled too**. ZCode namespaces MCP tools as
   `mcp__<server>__<tool>` (e.g. `mcp__codegraph__codegraph_explore`); the
   bridge maps that to a clean display name `<server>__<tool>` for the inline

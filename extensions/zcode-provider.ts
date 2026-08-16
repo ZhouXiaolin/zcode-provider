@@ -643,8 +643,20 @@ function normalizeToolInput(input: unknown): Record<string, unknown> {
 // app-server reports them, so reasoning, tools, results and the final answer
 // interleave in the transcript exactly like ZCode's own output.
 
-// Cap displayed tool output so a huge result does not flood the transcript.
+// Display caps for inline tool result blocks. The full result stays inside the
+// ZCode session — the agent's model already consumed it — so these only keep
+// the transcript readable, mirroring pi's own tool display:
+//   - bash: the command, a "... N earlier lines" marker and the TAIL of the
+//     output, closed with a "Took 0.0s" line (pi renders bash output as a
+//     tail preview plus a duration line)
+//   - read: collapses to the call line "read <path>:from-to" and hides the
+//     content (pi shows only the call for a collapsed read)
+// Every other tool keeps a hard cap on the head of the output.
 const MAX_RESULT_CHARS = 6000;
+// Tail lines shown under the "... N earlier lines" marker for bash output.
+const BASH_PREVIEW_LINES = 10;
+// Tools that return file contents; their result collapses to the call line.
+const READ_TOOLS = new Set(["read", "read_file", "view_file"]);
 
 function escapeInlineCode(s: string): string {
   return s.replace(/`/g, "\\`").replace(/\s*\n\s*/g, " ");
@@ -678,10 +690,28 @@ function toolArgsSummary(name: string, args: Record<string, unknown>): string | 
 function formatToolCall(name: string, args: Record<string, unknown>): string {
   const header = `**🔧 ${name}**`;
   const summary = toolArgsSummary(name, args);
-  if (summary) return `${header} — \`${escapeInlineCode(summary)}\``;
+  if (summary) return `${header} — \`${escapeInlineCode(summary)}${readRangeSuffix(name, args)}\``;
   const keys = Object.keys(args);
   if (keys.length === 0) return header;
   return `${header}\n\n\`\`\`json\n${JSON.stringify(args, null, 2)}\n\`\`\``;
+}
+
+// Like pi's read call (`read <path>:<from>-<to>`): append the requested line
+// range when the args carry offset/limit.
+function readRangeSuffix(name: string, args: Record<string, unknown>): string {
+  if (!READ_TOOLS.has(name.toLowerCase())) return "";
+  const offset = numArg(args.offset);
+  const limit = numArg(args.limit);
+  if (offset === undefined && limit === undefined) return "";
+  const start = offset ?? 1;
+  if (limit === undefined) return `:${start}`;
+  return `:${start}-${start + limit - 1}`;
+}
+
+function numArg(v: unknown): number | undefined {
+  if (typeof v === "number" && Number.isFinite(v)) return v;
+  if (typeof v === "string" && v.trim() !== "" && Number.isFinite(Number(v))) return Number(v);
+  return undefined;
 }
 
 // bash calls merge command + output into ONE fenced block, echoing pi's
@@ -721,21 +751,86 @@ function toolResultBody(result: ZcodeToolResult): string {
   return body;
 }
 
-function formatToolResult(result: ZcodeToolResult): string {
+// Tail preview mirroring pi's bash display: keep the last `maxLines` lines,
+// hard-capped at `maxChars`; a single over-long trailing line is shown from
+// its tail. Reports how many lines/chars were cut for the marker.
+function truncateTail(
+  text: string,
+  maxLines: number,
+  maxChars: number,
+): { text: string; omittedLines: number; omittedChars: number } {
+  const totalChars = text.length;
+  if (text.length <= maxChars) {
+    const lines = text.split("\n");
+    const cut = lines.length - maxLines;
+    if (cut <= 0) return { text, omittedLines: 0, omittedChars: 0 };
+    return { text: lines.slice(-maxLines).join("\n"), omittedLines: cut, omittedChars: 0 };
+  }
+  // Over the char cap: walk lines from the end until the budget fits.
+  const lines = text.split("\n");
+  const kept: string[] = [];
+  let keptChars = 0;
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const line = lines[i];
+    const cost = line.length + (kept.length > 0 ? 1 : 0); // +1 for the joining newline
+    if (keptChars + cost > maxChars) {
+      if (kept.length === 0) {
+        // A single line longer than the cap: show its tail.
+        kept.push("…" + line.slice(-(maxChars - 1)));
+      }
+      break;
+    }
+    kept.unshift(line);
+    keptChars += cost;
+  }
+  const visible = kept.join("\n");
+  return {
+    text: visible,
+    omittedLines: lines.length - kept.length,
+    omittedChars: totalChars - visible.length,
+  };
+}
+
+function formatDuration(ms: number): string {
+  return `${(ms / 1000).toFixed(1)}s`;
+}
+
+function formatToolResult(name: string, result: ZcodeToolResult): string {
+  if (READ_TOOLS.has(name.toLowerCase())) return formatReadResult(result);
   const body = toolResultBody(result);
   if (!body) return "";
   const marker = result.success === false ? "**⚠️ Tool failed**\n\n" : "";
   return `${marker}\`\`\`text\n${body}\n\`\`\``;
 }
 
-// Appended inside the merged bash fence: blank line, then the output, then
-// the closing fence. Failure is marked with a plain line (markdown inside a
-// ```text fence is not rendered).
-function formatBashResultClose(result: ZcodeToolResult): string {
-  const body = toolResultBody(result);
-  if (!body) return "\n```\n";
-  const marker = result.success === false ? "⚠️ Tool failed\n" : "";
-  return `\n${marker}${body}\n\`\`\`\n`;
+// File-read results collapse to nothing, like pi's collapsed read box — the
+// call line (`🔧 read — <path>:from-to`) is the whole display and the content
+// stays inside the ZCode session. Failures still show the error text.
+function formatReadResult(result: ZcodeToolResult): string {
+  if (result.success === false) {
+    const body = toolResultBody(result);
+    return body ? `**⚠️ Tool failed**\n\n\`\`\`text\n${body}\n\`\`\`` : "";
+  }
+  return "";
+}
+
+// Appended inside the merged bash fence: blank line, then the tail preview
+// ("... N earlier lines" marker + last lines), then a duration line like pi's
+// "Took 0.0s", then the closing fence. Failure is a plain line (markdown
+// inside a ```text fence is not rendered).
+function formatBashResultClose(result: ZcodeToolResult, startedAt?: number): string {
+  const footer: string[] = [];
+  if (result.truncated) footer.push("truncated by ZCode");
+  if (startedAt !== undefined) footer.push(`Took ${formatDuration(Date.now() - startedAt)}`);
+  const preview = truncateTail(toolResultContent(result).trim(), BASH_PREVIEW_LINES, MAX_RESULT_CHARS);
+  const parts: string[] = [];
+  if (result.success === false) parts.push("⚠️ Tool failed");
+  if (preview.omittedLines > 0) parts.push(`... (${preview.omittedLines} earlier lines)`);
+  else if (preview.omittedChars > 0) parts.push(`... (${preview.omittedChars} more chars)`);
+  const body = [parts.join(" · "), preview.text].filter((s) => s !== "").join("\n");
+  const tail = footer.length > 0 ? `\n\n${footer.join(" · ")}` : "";
+  if (!body && !tail) return "\n```\n";
+  return `\n${body}${tail}\n\`\`\`\n`;
 }
 
 // ---- interaction/requestUserInput (ZCode askUserQuestion) ----
@@ -1150,6 +1245,9 @@ function streamSimple(
     const toolNames = new Map<string, string>();
     const finalizedTools = new Set<string>();
     const pendingBashBlocks = new Map<string, number>();
+    // When each bash call started (call-open time, refined by the app-server's
+    // `tool.updated` started event), for the "Took 0.0s" duration line.
+    const bashStarts = new Map<string, number>();
     const started = new Set<number>();
     const ended = new Set<number>();
     const partialJson = new Map<string, string>();
@@ -1281,11 +1379,19 @@ function streamSimple(
         // Tool execution status/result notifications; render results inline
         // in the order the app-server reports them.
         const callId = pl.toolCallId ?? "";
+        const toolName = (toolNames.get(callId) ?? "").toLowerCase();
+        if (callId && toolName === "bash" && pl.kind === "started") {
+          // Most accurate start for the "Took 0.0s" line (falls back to the
+          // call-open time recorded when the bash block was rendered).
+          if (!bashStarts.has(callId)) bashStarts.set(callId, Date.now());
+          return;
+        }
         if (callId && pl.kind === "result" && pl.result !== undefined) {
-          if ((toolNames.get(callId) ?? "").toLowerCase() === "bash" && pendingBashBlocks.has(callId)) {
-            closeBashToolBlock(callId, formatBashResultClose(pl.result));
+          if (toolName === "bash" && pendingBashBlocks.has(callId)) {
+            closeBashToolBlock(callId, formatBashResultClose(pl.result, bashStarts.get(callId)));
           } else {
-            emitToolText(`result:${callId}`, formatToolResult(pl.result));
+            const md = formatToolResult(toolNames.get(callId) ?? "tool", pl.result);
+            if (md) emitToolText(`result:${callId}`, md);
           }
         }
         return;
@@ -1347,6 +1453,7 @@ function streamSimple(
               : parsePartialJson(partialJson.get(callId) ?? "");
           const name = toolNames.get(callId) ?? displayToolName(pl.toolName ?? "tool");
           if (name.toLowerCase() === "bash") {
+            if (!bashStarts.has(callId)) bashStarts.set(callId, Date.now());
             openBashToolBlock(callId, formatBashCallOpen(args));
           } else {
             emitToolText(`call:${callId}`, formatToolCall(name, args));
