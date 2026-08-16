@@ -31,8 +31,17 @@
 //
 // Flow: session/create {workspace:{workspacePath, workspaceKey}} -> answer
 // session/requestRuntimePreferences (runtime-materialization and
-// user-execution scopes) -> session/send {sessionId, content} -> wait for
-// state.updated reason "prompt_completed" -> session/messages -> text parts.
+// user-execution scopes) -> session/subscribe (turns on live session/event
+// notifications) -> session/send {sessionId, content, runtimeModel} -> stream
+// model.streaming / tool.updated / turn.* events -> done on state.updated
+// reason "prompt_completed". Without the subscription the turn still
+// completes and the final text is harvested from session/messages.
+//
+// Messages typed in pi while a turn is running follow ZCode's own
+// followupMode semantics (see ZCODE_STEER_MODE): queue (default) processes
+// them as a new turn after the current one; guide (opt-in) injects them into
+// the running session at the next tool/message boundary via the v4 command
+// channel (conversation subscription + setFollowupMode CAS + sendText).
 //
 // Server command overridable via env ZCODE_SERVE_CMD; default resolves the
 // ZCode install for the current platform (Linux /opt, macOS /Applications).
@@ -46,9 +55,12 @@ import type {
   Context,
   Model,
   SimpleStreamOptions,
+  ToolCall,
 } from "@earendil-works/pi-ai";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { InputEventResult } from "@earendil-works/pi-coding-agent";
 import { spawn, type ChildProcess } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { copyFileSync, existsSync, readFileSync, watch, writeFileSync } from "node:fs";
 import { appendFile } from "node:fs/promises";
 import { createInterface } from "node:readline";
@@ -58,6 +70,15 @@ const SETTINGS_PATH =
   process.env.ZCODE_SETTINGS ?? `${process.env.HOME ?? "~"}/.zcode/cli/config.json`;
 const V2_CONFIG_PATH =
   process.env.ZCODE_V2_CONFIG ?? `${process.env.HOME ?? "~"}/.zcode/v2/config.json`;
+
+// How a message typed in pi while a ZCode turn is running is delivered.
+//   queue (default): pi queues it; it runs as a new turn after the current
+//      one completes (ZCode followupMode "queue").
+//   guide: pi hands the text to the running ZCode session via the v4 command
+//      channel; ZCode injects it at the next tool/message boundary inside the
+//      SAME turn (ZCode followupMode "guide"), falling back to queue when the
+//      turn is not steerable.
+const STEER_MODE = process.env.ZCODE_STEER_MODE === "guide" ? "guide" : "queue";
 
 // Per-turn budget: when a turn exceeds this, the bridge interrupts it and
 // sends the session "go on" (see streamSimple), so long tasks checkpoint
@@ -351,6 +372,36 @@ let sessionId: string | null = null;
 let lastModelId: string | null = null;
 let probeLog: ((line: string) => void) | null = null;
 
+// Guide-steer state (ZCODE_STEER_MODE=guide): whether a ZCode turn is
+// currently running (pi input events during it can be injected live) and the
+// v4 publisher facts needed for the setFollowupMode CAS command.
+let turnActive = false;
+const guideSessions = new Set<string>();
+const v4StateBySession = new Map<
+  string,
+  { logEpoch?: string; revision: number; snapshotRevision?: number }
+>();
+
+// Track session revisions from session-scope state.updated notifications and
+// the initial v4 conversation snapshot so the CAS setFollowupMode command can
+// present a fresh baseRevision.
+listeners.add((msg) => {
+  const m = msg as {
+    method?: string;
+    params?: { scope?: string; sessionId?: string; revision?: number };
+  };
+  if (
+    m.method === "state.updated" &&
+    m.params?.scope === "session" &&
+    m.params?.sessionId &&
+    typeof m.params.revision === "number"
+  ) {
+    const st = v4StateBySession.get(m.params.sessionId) ?? { revision: 0 };
+    st.revision = Math.max(st.revision, m.params.revision);
+    v4StateBySession.set(m.params.sessionId, st);
+  }
+});
+
 function startServer(): void {
   if (proc) return;
   mergeV2Providers();
@@ -417,6 +468,172 @@ interface ZcodeMessage {
   parts: ZcodeMessagePart[];
 }
 
+// A live session/event notification (method "session/event") pushed by the
+// app-server after a session/subscribe. The interesting payloads:
+//   model.streaming: {kind: text_start|text_delta|text_end|reasoning_start|
+//       reasoning_delta|reasoning_end|tool_input_start|tool_input_delta|
+//       tool_input_end|tool_call, delta?, input?, assistantMessageId?,
+//       toolCallId?, toolName?}
+//   turn.completed:  {response}   turn.failed: {reason}
+interface ZcodeStreamEvent {
+  type: string;
+  payload?: {
+    kind?: string;
+    delta?: string;
+    input?: unknown;
+    assistantMessageId?: string;
+    toolCallId?: string;
+    toolName?: string;
+    reason?: string;
+    response?: string;
+  };
+}
+
+function parsePartialJson(s: string): Record<string, unknown> {
+  try {
+    const v: unknown = JSON.parse(s);
+    return v && typeof v === "object" && !Array.isArray(v)
+      ? (v as Record<string, unknown>)
+      : {};
+  } catch {
+    return {};
+  }
+}
+
+function normalizeToolInput(input: unknown): Record<string, unknown> {
+  if (input && typeof input === "object" && !Array.isArray(input)) {
+    return input as Record<string, unknown>;
+  }
+  return typeof input === "string" ? parsePartialJson(input) : {};
+}
+
+// The app-server does not emit the final text until prompt_completed, but
+// session/messages right after completion is always queryable; used as the
+// non-streaming fallback when live subscription failed.
+async function harvestLastAssistantText(): Promise<string> {
+  if (!sessionId) return "";
+  try {
+    // Small settle delay so the final message is queryable.
+    await delay(500);
+    const msgs = await request<{ messages: ZcodeMessage[] }>("session/messages", {
+      sessionId,
+    });
+    const lastAssistant = [...(msgs.messages ?? [])]
+      .reverse()
+      .find((m) => m.info?.role === "assistant");
+    return (lastAssistant?.parts ?? [])
+      .filter((p) => p.type === "text")
+      .map((p) => p.text ?? "")
+      .join("");
+  } catch {
+    return "";
+  }
+}
+
+// Enable ZCode-native "guide" handling on a session: v4 conversation
+// subscription (creates the publisher whose inputRouting drives the delivery
+// decision), then setFollowupMode guide (CAS). Best-effort: on any failure
+// (unsupported build, CAS revision mismatch) the session stays in queue mode
+// and sendText inputs are processed after the current turn.
+async function setupGuideMode(sid: string): Promise<void> {
+  if (STEER_MODE !== "guide" || guideSessions.has(sid)) return;
+  guideSessions.add(sid);
+  if (!proc) return;
+  let snapshotSeen = false;
+  const onFrame = (msg: unknown) => {
+    const m = msg as {
+      method?: string;
+      params?: {
+        topic?: string;
+        frame?: {
+          payload?: {
+            kind?: string;
+            snapshot?: { revision?: number; logEpoch?: string };
+          };
+        };
+      };
+    };
+    if (m.method !== "v4/conversation/frame" || typeof m.params?.topic !== "string") return;
+    // Frames carry the conversation topic, not the sessionId.
+    const frameSid = m.params.topic.startsWith("conversation/")
+      ? m.params.topic.slice("conversation/".length)
+      : undefined;
+    if (!frameSid) return;
+    const snap = m.params.frame?.payload?.snapshot;
+    if (typeof snap?.revision === "number") {
+      const st = v4StateBySession.get(frameSid) ?? { revision: 0 };
+      // The snapshot revision is what the CAS compares against; session-scope
+      // state.updated revisions may already exceed it (they surface the reach
+      // ahead of the publisher snapshot), so keep the raw snapshot value.
+      st.snapshotRevision = snap.revision;
+      st.revision = Math.max(st.revision, snap.revision);
+      if (snap.logEpoch) st.logEpoch ??= snap.logEpoch;
+      v4StateBySession.set(frameSid, st);
+    }
+    if (m.params.frame?.payload?.kind === "snapshot") snapshotSeen = true;
+  };
+  listeners.add(onFrame);
+  try {
+    const sub = await request<{ ack?: { logEpoch?: string } }>(
+      "v4/conversation/subscribe",
+      {
+        topic: `conversation/${sid}`,
+        connectionId: `pi-${randomUUID()}`,
+        clientMode: "desktop-continuous",
+      },
+    );
+    const st = v4StateBySession.get(sid) ?? { revision: 0 };
+    st.logEpoch ??= sub.ack?.logEpoch;
+    v4StateBySession.set(sid, st);
+    // The subscription response is followed by an outbox flush of the initial
+    // conversation frames (payload.kind "snapshot" carries the session's
+    // authoritative revision); wait for one so the CAS baseRevision is fresh.
+    const deadline = Date.now() + 3000;
+    while (!snapshotSeen && Date.now() < deadline) await delay(100);
+    // CAS setFollowupMode; on a stale baseRevision retry once the frames
+    // report a newer one.
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const cur = v4StateBySession.get(sid);
+      if (process.env.ZCODE_DEBUG)
+        console.error(
+          "[zcode-debug] CAS attempt", attempt,
+          "revision =", cur?.revision,
+          "logEpoch =", cur?.logEpoch,
+        );
+      const fm = await request<{ status?: string; reasonCode?: string }>(
+        "v4/command",
+        {
+          commandId: `pi-fm-${nextId++}`,
+          clientId: "pi-bridge",
+          sessionId: sid,
+          type: "setFollowupMode",
+          payload: { mode: "guide" },
+          baseRevision: cur?.snapshotRevision ?? cur?.revision ?? 0,
+          baseLogEpoch: cur?.logEpoch,
+          issuedAt: Date.now(),
+        },
+      );
+      if (process.env.ZCODE_DEBUG)
+        console.error("[zcode-debug] setFollowupMode ack:", JSON.stringify(fm));
+      if (fm?.status !== "stale") return;
+      // Wait for a newer snapshot/delta revision before retrying.
+      const before = v4StateBySession.get(sid)?.revision ?? 0;
+      const retryDeadline = Date.now() + 1500;
+      while (
+        Date.now() < retryDeadline &&
+        (v4StateBySession.get(sid)?.revision ?? 0) === before
+      ) {
+        await delay(100);
+      }
+    }
+  } catch (e) {
+    if (process.env.ZCODE_DEBUG)
+      console.error("[zcode-debug] setupGuideMode failed:", e instanceof Error ? e.message : String(e));
+  } finally {
+    listeners.delete(onFrame);
+  }
+}
+
 function streamSimple(
   model: Model<Api>,
   context: Context,
@@ -443,15 +660,8 @@ function streamSimple(
 
   (async () => {
     out.push({ type: "start", partial: output });
-    let text = "";
-    const emit = (t: string) => {
-      if (!t) return;
-      text += t;
-      out.push({ type: "text_delta", contentIndex: 0, delta: t, partial: output });
-    };
     const finish = (reason: "stop" | "error" | "aborted", errorMessage?: string) => {
       if (output.stopReason !== "pending") return;
-      output.content = text ? [{ type: "text", text }] : [];
       if (reason === "stop") {
         output.stopReason = "stop";
         out.push({ type: "done", reason: "stop", message: output });
@@ -461,7 +671,168 @@ function streamSimple(
         out.push({ type: "error", reason, error: output });
       }
     };
+
+    // ---- Live-stream bookkeeping. The app-server can batch away the
+    // *_start markers of a stream, so every event must be able to lazily
+    // create its content block; deltas append and *_end finalize. Blocks are
+    // keyed by assistantMessageId (text/reasoning) or toolCallId (tool calls).
+    const msgBlocks = new Map<string, { text?: number; thinking?: number }>();
+    const toolBlocks = new Map<string, number>();
+    const started = new Set<number>();
+    const ended = new Set<number>();
+    const partialJson = new Map<string, string>();
+    let streamedText = false;
+    let finalResponse: string | undefined;
+    let settled = false;
+    let turnSettled = false;
+    let failed = false;
+
+    const blockAt = (idx: number) => output.content[idx];
+    const blockFor = (msgKey: string, kind: "text" | "thinking"): number => {
+      const entry = msgBlocks.get(msgKey) ?? {};
+      let idx = kind === "text" ? entry.text : entry.thinking;
+      if (idx === undefined) {
+        idx = output.content.length;
+        output.content.push(
+          kind === "text" ? { type: "text", text: "" } : { type: "thinking", thinking: "" },
+        );
+        if (kind === "text") entry.text = idx;
+        else entry.thinking = idx;
+        msgBlocks.set(msgKey, entry);
+      }
+      return idx;
+    };
+    const toolFor = (callId: string, toolName: string): number => {
+      let idx = toolBlocks.get(callId);
+      if (idx === undefined) {
+        idx = output.content.length;
+        output.content.push({
+          type: "toolCall",
+          id: callId,
+          name: toolName,
+          arguments: {},
+        });
+        toolBlocks.set(callId, idx);
+      }
+      return idx;
+    };
+    const emitStart = (idx: number, kind: "text" | "thinking" | "toolcall") => {
+      if (started.has(idx)) return;
+      started.add(idx);
+      out.push({
+        type: kind === "toolcall" ? "toolcall_start" : kind === "text" ? "text_start" : "thinking_start",
+        contentIndex: idx,
+        partial: output,
+      });
+    };
+    const emitDelta = (idx: number, delta: string, kind: "text" | "thinking") => {
+      const block = blockAt(idx);
+      if (kind === "text") (block as { text: string }).text += delta;
+      else (block as { thinking: string }).thinking += delta;
+      emitStart(idx, kind);
+      out.push({
+        type: kind === "text" ? "text_delta" : "thinking_delta",
+        contentIndex: idx,
+        delta,
+        partial: output,
+      });
+    };
+    const emitEnd = (idx: number, kind: "text" | "thinking" | "toolcall") => {
+      if (ended.has(idx)) return;
+      ended.add(idx);
+      const block = blockAt(idx);
+      if (kind === "toolcall") {
+        out.push({
+          type: "toolcall_end",
+          contentIndex: idx,
+          toolCall: block as ToolCall,
+          partial: output,
+        });
+      } else {
+        out.push({
+          type: kind === "text" ? "text_end" : "thinking_end",
+          contentIndex: idx,
+          content: kind === "text" ? (block as { text: string }).text : (block as { thinking: string }).thinking,
+          partial: output,
+        });
+      }
+    };
+
+    // Live process: model.streaming carries the assistant text, reasoning and
+    // tool-call streams in real time; turn.completed delivers the final
+    // response as a fallback. state.updated (prompt_completed/prompt_failed)
+    // remains the terminal signal.
+    const onEvent = (msg: unknown) => {
+      if (typeof msg !== "object" || msg === null) return;
+      const m = msg as { method?: string; params?: unknown };
+      if (!m.method || !m.params) return;
+      if (m.method === "state.updated") {
+        const reason = (m.params as { reason?: string }).reason;
+        if (reason === "prompt_completed") settled = true;
+        if (reason === "prompt_failed") failed = true;
+        if (reason === "prompt_completed" || reason === "prompt_failed") turnSettled = true;
+        return;
+      }
+      if (m.method !== "session/event") return;
+      const ev = m.params as ZcodeStreamEvent;
+      if (!ev.type) return;
+      const pl = ev.payload ?? {};
+      if (ev.type === "turn.completed") {
+        if (typeof pl.response === "string" && pl.response) finalResponse = pl.response;
+        settled = true;
+        turnSettled = true;
+        return;
+      }
+      if (ev.type === "turn.failed") {
+        failed = true;
+        turnSettled = true;
+        return;
+      }
+      if (ev.type !== "model.streaming") return;
+      const kind = pl.kind;
+      const key = pl.assistantMessageId ?? "";
+      if (kind === "text_start" || kind === "text_delta") {
+        const idx = blockFor(key, "text");
+        if (typeof pl.delta === "string" && pl.delta) {
+          streamedText = true;
+          emitDelta(idx, pl.delta, "text");
+        } else emitStart(idx, "text");
+      } else if (kind === "text_end") {
+        emitEnd(blockFor(key, "text"), "text");
+      } else if (kind === "reasoning_start" || kind === "reasoning_delta") {
+        const idx = blockFor(key, "thinking");
+        if (typeof pl.delta === "string" && pl.delta) emitDelta(idx, pl.delta, "thinking");
+        else emitStart(idx, "thinking");
+      } else if (kind === "reasoning_end") {
+        emitEnd(blockFor(key, "thinking"), "thinking");
+      } else if (kind === "tool_input_start") {
+        emitStart(toolFor(pl.toolCallId ?? "", pl.toolName ?? "tool"), "toolcall");
+      } else if (kind === "tool_input_delta") {
+        const callId = pl.toolCallId ?? "";
+        const acc = (partialJson.get(callId) ?? "") + (pl.delta ?? "");
+        partialJson.set(callId, acc);
+        const idx = toolFor(callId, pl.toolName ?? "tool");
+        const block = blockAt(idx) as ToolCall;
+        block.arguments = parsePartialJson(acc);
+        emitStart(idx, "toolcall");
+        out.push({ type: "toolcall_delta", contentIndex: idx, delta: pl.delta ?? "", partial: output });
+      } else if (kind === "tool_input_end" || kind === "tool_call") {
+        const callId = pl.toolCallId ?? "";
+        const idx = toolFor(callId, pl.toolName ?? "tool");
+        const block = blockAt(idx) as ToolCall;
+        if (kind === "tool_call" && pl.input !== undefined) {
+          block.arguments = normalizeToolInput(pl.input);
+        } else {
+          const acc = partialJson.get(callId);
+          if (acc !== undefined) block.arguments = parsePartialJson(acc);
+        }
+        emitStart(idx, "toolcall");
+        emitEnd(idx, "toolcall");
+      }
+    };
+
     let ref: { providerId: string; modelId: string };
+    let prompt = "";
     try {
       ref = resolveModelRef(model.id);
       if (!sessionId) {
@@ -484,40 +855,22 @@ function streamSimple(
         lastModelId = model.id;
       }
       const last = [...context.messages].reverse().find((m) => m.role === "user");
-      const prompt =
+      prompt =
         typeof last?.content === "string"
           ? last.content
           : (last?.content ?? []).map((c) => (c.type === "text" ? c.text : "")).join("");
       if (!prompt) throw new Error("no user message in context");
-      // runtimeModel clears the app-server's restoreWarning on cold resumes (see
-      // runtimeModelOf) and keeps the workspace model catalog populated.
-      await request("session/send", {
-        sessionId,
-        content: prompt,
-        runtimeModel: runtimeModelOf(ref.providerId, ref.modelId),
-      });
     } catch (e) {
       finish("error", e instanceof Error ? e.message : String(e));
       return;
     }
 
-    let settled = false;
-    // Any turn ending (completed or failed) releases the app-server's turn
-    // lock; the checkpoint path waits for that before sending the next turn.
-    let turnSettled = false;
-    const onEvent = (msg: unknown) => {
-      if (typeof msg !== "object" || msg === null) return;
-      if (!("method" in msg) || !("params" in msg)) return;
-      if (msg.method !== "state.updated") return;
-      const p = msg.params;
-      if (typeof p !== "object" || p === null || !("reason" in p)) return;
-      const reason = p.reason;
-      if (reason === "prompt_completed") settled = true;
-      if (reason === "prompt_completed" || reason === "prompt_failed") turnSettled = true;
-    };
+    // Listen BEFORE session/send: the app-server streams the first deltas
+    // almost immediately after the turn starts, while send is still awaiting.
     listeners.add(onEvent);
     const abortHandler = () => {
       listeners.delete(onEvent);
+      turnActive = false;
       clearTimeout(timer);
       void request("session/stop", { sessionId }).catch(() => {});
       finish("aborted", "aborted by user");
@@ -552,30 +905,57 @@ function streamSimple(
     }, TURN_TIMEOUT_MS);
     timer.unref?.();
 
-    while (!settled) {
+    try {
+      // session/subscribe switches on live session/event notifications
+      // (desktop-continuous = push, not replay). Best-effort: without it the
+      // turn still completes and the harvest below yields the final text.
+      await request("session/subscribe", {
+        sessionId,
+        deliveryKind: "desktop-continuous",
+      }).catch(() => {});
+      // ZCode-native steer mode (guide): make the session inject inputs sent
+      // while the turn is running at the next tool/message boundary.
+      await setupGuideMode(sessionId);
+      // runtimeModel clears the app-server's restoreWarning on cold resumes (see
+      // runtimeModelOf) and keeps the workspace model catalog populated.
+      await request("session/send", {
+        sessionId,
+        content: prompt,
+        runtimeModel: runtimeModelOf(ref.providerId, ref.modelId),
+      });
+      turnActive = true;
+    } catch (e) {
+      listeners.delete(onEvent);
+      clearTimeout(timer);
+      turnActive = false;
+      finish("error", e instanceof Error ? e.message : String(e));
+      return;
+    }
+
+    while (!settled && !failed) {
       if (output.stopReason !== "pending") return; // aborted/error already finished
       await delay(250);
     }
     clearTimeout(timer);
     listeners.delete(onEvent);
+    turnActive = false;
 
-    try {
-      // Small settle delay so the final message is queryable.
-      await delay(500);
-      const msgs = await request<{ messages: ZcodeMessage[] }>("session/messages", { sessionId });
-      const lastAssistant = [...(msgs.messages ?? [])]
-        .reverse()
-        .find((m) => m.info?.role === "assistant");
-      emit(
-        (lastAssistant?.parts ?? [])
-          .filter((p) => p.type === "text")
-          .map((p) => p.text ?? "")
-          .join(""),
-      );
-      finish("stop");
-    } catch (e) {
-      finish("error", e instanceof Error ? e.message : String(e));
+    if (failed) {
+      finish("error", "zcode turn ended with failure");
+      return;
     }
+    if (!streamedText) {
+      // No live deltas arrived (unsubscribed/quiet model): fall back to the
+      // definitive final response, then to the messages store.
+      const full = (finalResponse ?? "").trim() || (await harvestLastAssistantText());
+      if (full) {
+        const idx = blockFor("", "text");
+        streamedText = true;
+        emitDelta(idx, full, "text");
+        emitEnd(idx, "text");
+      }
+    }
+    finish("stop");
   })();
   return out;
 }
@@ -654,7 +1034,36 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
+  // ZCode-native steer: with ZCODE_STEER_MODE=guide, a message typed in pi
+  // while the ZCode turn is running is sent straight to the running session
+  // via the v4 command channel (sendText). The app-server admits it as a
+  // guide input (injected at the next tool/message boundary) or falls back to
+  // a queue. Returning "handled" keeps pi from duplicating it into its own
+  // next turn; on any failure we fall back to pi's normal queueing.
+  pi.on("input", async (event): Promise<InputEventResult> => {
+    if (STEER_MODE !== "guide") return { action: "continue" };
+    if (event.streamingBehavior !== "steer") return { action: "continue" };
+    if (!turnActive || !sessionId) return { action: "continue" };
+    try {
+      await request("v4/command", {
+        commandId: `pi-steer-${nextId++}`,
+        clientId: "pi-bridge",
+        sessionId,
+        type: "sendText",
+        payload: { text: event.text, attachments: [] },
+        issuedAt: Date.now(),
+      });
+      return { action: "handled" };
+    } catch (e) {
+      if (process.env.ZCODE_DEBUG) console.error("[zcode-debug] steer sendText failed:", e instanceof Error ? e.message : String(e));
+      return { action: "continue" };
+    }
+  });
+
   pi.on("session_shutdown", async () => {
+    turnActive = false;
+    guideSessions.clear();
+    v4StateBySession.clear();
     if (sessionId) {
       try {
         await request("session/close", { sessionId });

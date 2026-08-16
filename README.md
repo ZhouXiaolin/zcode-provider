@@ -2,8 +2,9 @@
 
 Turn the **ZCode** agent (`zcodex app-server`, an OpenCode-derived CLI agent) into a
 pi model provider. pi is the chat frontend; the ZCode agent keeps its own
-session, runs its own tools (bash, edits, plugins, ...), and its text reply is
-streamed back into pi.
+session, runs its own tools (bash, edits, plugins, ...), and its reply is
+streamed back into pi in real time — the reasoning, the tool calls and the
+final text all arrive as they happen, not as one chunk at the end.
 
 Each ZCode provider/model configured in ZCode becomes a selectable pi model, and
 the list auto-syncs from ZCode's config — no hardcoded model list, no pi reload
@@ -68,6 +69,7 @@ Environment variables (set before starting pi):
 | `ZCODE_V2_CONFIG` | `~/.zcode/v2/config.json` | ZCode UI config whose enabled providers are merged in |
 | `ZCODE_AUTO_ALLOW` | `1` (enabled) | Auto-answer ZCode permission prompts. Set to `0` to deny tool permission requests |
 | `ZCODE_TURN_TIMEOUT_MS` | `1800000` (30 min) | Per-turn budget. On timeout the bridge interrupts the turn (`session/stop`) and sends the session `go on`, so long tasks keep progressing instead of failing. Raise it for turns that need to run longer uninterrupted |
+| `ZCODE_STEER_MODE` | `queue` | How a message typed in pi while a ZCode turn is running is handled, using ZCode's own two delivery modes: `queue` (processed as a new turn after the current one completes — pi's standard behavior) or `guide` (sent to the running session via ZCode's v4 command channel and injected at the next tool/message boundary inside the same turn, falling back to a queue when the turn is not steerable) |
 
 ## Security
 
@@ -91,14 +93,34 @@ the raw protocol lines to `/tmp/zcode-probe.jsonl`.
 JSON-RPC). The bridge implements the subset:
 
 `session/create` → answer `session/requestRuntimePreferences` → `session/resume`
-(no-op while resident, rehydrates after idle eviction) → `session/send` → wait for
-`state.updated` (reason `prompt_completed`) → `session/messages` → assistant text
-parts. Model switching uses `session/setModel`.
+(no-op while resident, rehydrates after idle eviction) → `session/subscribe` →
+`session/send` → stream `session/event` notifications: `model.streaming`
+(text/reasoning/tool-input deltas), `tool.updated`, `turn.completed` — done on
+`state.updated` (reason `prompt_completed`). Model switching uses
+`session/setModel`.
 
 The ZCode app-server evicts idle sessions from memory (resident pool: 10 min
 idle timeout, LRU beyond 16 sessions) and would otherwise reject stale session
 ids with "Session is not active"; the bridge resumes the persisted session
 before every turn, so multi-turn continuity survives idle gaps.
+
+## Updates while a turn is running
+
+Messages typed in pi while the ZCode agent is mid-task are delivered using
+**ZCode's own two delivery modes** (its `followupMode` setting):
+
+- `ZCODE_STEER_MODE=queue` (default): pi queues the message and runs it as a
+  new ZCode turn once the current one completes — nothing is injected mid-run.
+  This is ZCode's `queue` followupMode and pi's standard model-provider flow.
+- `ZCODE_STEER_MODE=guide`: the bridge enables ZCode's `guide` followupMode on
+  the session (v4 conversation subscription + CAS `setFollowupMode`) and hooks
+  pi's `input` event. A message typed while the turn is running is sent to the
+  running session via the v4 `sendText` command; ZCode injects it at the next
+  tool/message boundary **inside the same turn** (`turn.steerQueued` →
+  `turn.steerDrained`), falling back to a queue when the turn is not steerable
+  or already has queued input. pi marks the message as handled, so it is not
+  duplicated into the next turn. The steered run's reply streams into pi as
+  usual.
 
 ## Known limitations
 
@@ -107,8 +129,10 @@ before every turn, so multi-turn continuity survives idle gaps.
   `go on`, so the ZCode agent continues the task with its full session history.
   The pi stream stays open until the task completes. Stopping the turn in pi
   aborts the server-side turn too.
-- Replies arrive as one chunk after the ZCode turn completes (tools included);
-  no token-level streaming on the wire.
+- The app-server streams reasoning, tool calls and text live (`model.streaming`
+  events after `session/subscribe`); deltas arrive chunked, and the final text
+  is also reconciled from the messages store when no live deltas were seen
+  (e.g. subscription failed).
 - pi's RPC/print mode has a model-resolver crash in some pi 0.84.2 builds that
   also affects built-in providers; interactive `/model` is unaffected.
 - The resident-pool eviction cannot be configured from outside the app-server;
