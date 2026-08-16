@@ -47,7 +47,7 @@
 // ZCode install for the current platform (Linux /opt, macOS /Applications).
 // Permission requests are auto-allowed unless ZCODE_AUTO_ALLOW=0 (the point is
 // that the ZCode agent executes tasks). Verify raw traffic with /zcode-probe.
-import { createAssistantMessageEventStream, Type } from "@earendil-works/pi-ai";
+import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
 import type {
   Api,
   AssistantMessage,
@@ -55,7 +55,6 @@ import type {
   Context,
   Model,
   SimpleStreamOptions,
-  ToolCall,
 } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { InputEventResult } from "@earendil-works/pi-coding-agent";
@@ -472,91 +471,13 @@ let turnActive = false;
 // (v4 stop / session/stop) leaves them running; the bridge cancels them when a
 // pi turn is aborted so a cancel in pi stops everything the agent started.
 const runningTasksBySession = new Map<string, Set<string>>();
-// Display-only tool plumbing. ZCode executes its own tools inside its session,
-// so pi must never actually run them. Every zcode tool name gets a registered
-// no-op tool whose execute() returns the result ZCode already produced (stashed
-// here from tool.updated events) with terminate:true — pi then renders the
-// call + result as a NATIVE tool box (ToolExecutionComponent) and, because
-// every result in the batch terminates, never re-prompts the model. The
-// registration overrides pi builtins of the same name in the session (e.g.
-// "Bash"), which is correct here: the zcode model runs its own tools and never
-// uses pi's tool implementations.
-const toolResultsByCall = new Map<string, string>();
-const registeredDisplayTools = new Set<string>();
-// The display-tool definitions we registered (name -> def), so a tool first
-// seen mid-stream can also be pushed into the CURRENT turn's context.tools
-// (pi's loop snapshots the tool list before streaming; pushing into the same
-// array reference the snapshot holds makes the no-op tool resolvable for the
-// turn that is already running — otherwise pi reports "Tool not found" and
-// re-prompts the model).
-const registeredToolDefs = new Map<string, { name: string; description: string; parameters: unknown; execute: (toolCallId: string) => Promise<{ content: { type: "text"; text: string }[]; details: Record<string, never>; terminate: true }> }>();
-let extApi: ExtensionAPI | null = null;
-
-// ZCode's tool set (observed from session messages); registered as display-only
-// so pi renders native tool boxes without executing them. Unknown names are
-// registered lazily on first sight (see streamSimple).
-const ZCODE_TOOL_NAMES = [
-  "Agent",
-  "AskUserQuestion",
-  "Bash",
-  "CronCreate",
-  "CronDelete",
-  "CronList",
-  "CronUpdate",
-  "Edit",
-  "EnterPlanMode",
-  "ExitPlanMode",
-  "Read",
-  "Skill",
-  "TaskOutput",
-  "TaskStop",
-  "TodoRead",
-  "TodoWrite",
-  "WebFetch",
-  "Write",
-  "SendMessage",
-  "ReadSessionContext",
-];
-
 // ZCode tool names are namespaced: builtins are plain ("Bash", "Read"),
 // MCP tools are "mcp__<server>__<tool>" (e.g. "mcp__codegraph__codegraph_explore"),
-// skills/plugins may use their own prefixes. pi renders the toolCall block's
-// name verbatim as the box title, so map zcode names to clean display names:
+// skills/plugins may use their own prefixes. Tool calls are rendered inline in
+// the transcript (see streamSimple), so map zcode names to clean display names:
 //   "mcp__codegraph__codegraph_explore" -> "codegraph__codegraph_explore"
-// The double underscore keeps zcode-MCP tools visually distinct from pi's own
-// MCP tools (pi names those "<server>_<tool>", single underscore), so the
-// no-op display tools never shadow pi's own MCP tools. The toolCall block and
-// the registered no-op tool both use the display name, so pi's loop still
-// finds the tool (by name) and executes it as a display-only box.
 function displayToolName(toolName: string): string {
   return toolName.startsWith("mcp__") ? toolName.slice("mcp__".length) : toolName;
-}
-
-function ensureDisplayTool(pi: ExtensionAPI | null, name: string): void {
-  if (!pi || !name || registeredDisplayTools.has(name)) return;
-  registeredDisplayTools.add(name);
-  const def = {
-    name,
-    label: name,
-    description: `Display-only tool executed by the ZCode agent (zcode-provider bridge).`,
-    parameters: Type.Record(Type.String(), Type.Any()),
-    async execute(toolCallId: string) {
-      const res = toolResultsByCall.get(toolCallId);
-      toolResultsByCall.delete(toolCallId);
-      return {
-        content: [{ type: "text", text: res ?? "" }],
-        details: {},
-        terminate: true,
-      };
-    },
-  };
-  registeredToolDefs.set(name, {
-    name: def.name,
-    description: def.description,
-    parameters: def.parameters,
-    execute: def.execute,
-  });
-  pi.registerTool(def);
 }
 // The pi UI context, captured at session_start. Used to show the question
 // dialog when the ZCode app-server asks the user (interaction/requestUserInput,
@@ -714,14 +635,63 @@ function normalizeToolInput(input: unknown): Record<string, unknown> {
 }
 
 // ---- Tool display. ZCode executes its own tools inside its session, so the
-// bridge emits real pi toolCall content blocks and registers a matching
-// display-only (no-op, terminate) tool per name — pi then renders each call +
-// result as a native ToolExecutionComponent box and never executes the tool
-// itself. The result text ZCode reports is stashed here (keyed by toolCallId)
-// and handed back by the no-op execute() at turn end.
+// bridge never emits pi toolCall blocks (pi's harness would try to execute
+// them itself, and pi's TUI renders every toolCall block as a box appended
+// BELOW the assistant message — splitting the transcript into a text part on
+// top and a tool part below). Instead each tool call and its result are
+// rendered as inline markdown text blocks appended in the order the
+// app-server reports them, so reasoning, tools, results and the final answer
+// interleave in the transcript exactly like ZCode's own output.
 
-// Cap displayed tool output so a huge result does not flood the box.
+// Cap displayed tool output so a huge result does not flood the transcript.
 const MAX_RESULT_CHARS = 6000;
+
+function escapeInlineCode(s: string): string {
+  return s.replace(/`/g, "\\`").replace(/\s*\n\s*/g, " ");
+}
+
+// One-line summary of the arguments for the common ZCode tools; null when the
+// args are too complex to summarize (the call falls back to a JSON block).
+function toolArgsSummary(name: string, args: Record<string, unknown>): string | null {
+  if (name === "askUserQuestion") {
+    const qs = args.questions;
+    if (Array.isArray(qs) && qs.length > 0) {
+      const first = qs[0] as { question?: string; header?: string };
+      const label = first?.question || first?.header || "";
+      if (label) return qs.length === 1 ? label : `${label} (+${qs.length - 1} more)`;
+    }
+  }
+  const cmd = args.command;
+  if (typeof cmd === "string" && cmd.trim()) return cmd.trim();
+  for (const key of ["filePath", "file_path", "path", "file"]) {
+    const v = args[key];
+    if (typeof v === "string" && v.trim()) return v.trim();
+  }
+  const keys = Object.keys(args);
+  if (keys.length === 1) {
+    const v = args[keys[0]];
+    if (typeof v === "string" && v.trim()) return v.trim();
+  }
+  return null;
+}
+
+function formatToolCall(name: string, args: Record<string, unknown>): string {
+  const header = `**🔧 ${name}**`;
+  const summary = toolArgsSummary(name, args);
+  if (summary) return `${header} — \`${escapeInlineCode(summary)}\``;
+  const keys = Object.keys(args);
+  if (keys.length === 0) return header;
+  return `${header}\n\n\`\`\`json\n${JSON.stringify(args, null, 2)}\n\`\`\``;
+}
+
+// bash calls merge command + output into ONE fenced block, echoing pi's
+// native `$ cmd` + output rendering (the bridge cannot emit real toolCall
+// blocks because ZCode executes the tools itself). The call opens the fence
+// with the command; the result appends the output and closes it.
+function formatBashCallOpen(args: Record<string, unknown>): string {
+  const cmd = typeof args.command === "string" ? args.command.trim() : "";
+  return "```text\n$ " + (cmd || "(no command)") + "\n";
+}
 
 function toolResultContent(result: ZcodeToolResult): string {
   const content = result.content;
@@ -749,6 +719,23 @@ function toolResultBody(result: ZcodeToolResult): string {
   }
   if (result.truncated) body += "\n… (truncated by ZCode)";
   return body;
+}
+
+function formatToolResult(result: ZcodeToolResult): string {
+  const body = toolResultBody(result);
+  if (!body) return "";
+  const marker = result.success === false ? "**⚠️ Tool failed**\n\n" : "";
+  return `${marker}\`\`\`text\n${body}\n\`\`\``;
+}
+
+// Appended inside the merged bash fence: blank line, then the output, then
+// the closing fence. Failure is marked with a plain line (markdown inside a
+// ```text fence is not rendered).
+function formatBashResultClose(result: ZcodeToolResult): string {
+  const body = toolResultBody(result);
+  if (!body) return "\n```\n";
+  const marker = result.success === false ? "⚠️ Tool failed\n" : "";
+  return `\n${marker}${body}\n\`\`\`\n`;
 }
 
 // ---- interaction/requestUserInput (ZCode askUserQuestion) ----
@@ -1137,6 +1124,9 @@ function streamSimple(
     out.push({ type: "start", partial: output });
     const finish = (reason: "stop" | "error" | "aborted", errorMessage?: string) => {
       if (output.stopReason !== "pending") return;
+      // Close any bash blocks still awaiting their result so every text block
+      // ends (pi finalizes messages on text_end).
+      flushPendingBashBlocks();
       if (reason === "stop") {
         output.stopReason = "stop";
         out.push({ type: "done", reason: "stop", message: output });
@@ -1149,15 +1139,17 @@ function streamSimple(
 
     // ---- Live-stream bookkeeping. The app-server can batch away the
     // *_start markers of a stream, so every event must be able to lazily
-    // create its content block; deltas append and *_end finalize. Blocks are
-    // keyed by assistantMessageId (text/reasoning). ZCode runs its own tools,
-    // so tool calls are emitted as real pi toolCall blocks (keyed by
-    // toolCallId) rendered as native tool boxes; the registered display-only
-    // tool returns the stashed result at turn end.
+    // create its content block; deltas append and *_end finalize. Text and
+    // reasoning blocks are keyed by assistantMessageId (the app-server emits
+    // a fresh id per reasoning/text/tool round, so segments interleave).
+    // ZCode runs its own tools, so tool calls/results are rendered inline as
+    // text blocks keyed by toolCallId — pi would otherwise execute toolCall
+    // blocks itself and its TUI renders them as boxes below the message.
     const msgBlocks = new Map<string, { text?: number; thinking?: number }>();
+    const toolTextBlocks = new Map<string, number>();
     const toolNames = new Map<string, string>();
-    const toolCallIndex = new Map<string, number>();
     const finalizedTools = new Set<string>();
+    const pendingBashBlocks = new Map<string, number>();
     const started = new Set<number>();
     const ended = new Set<number>();
     const partialJson = new Map<string, string>();
@@ -1214,6 +1206,46 @@ function streamSimple(
         partial: output,
       });
     };
+    const toolTextFor = (callId: string): number => {
+      let idx = toolTextBlocks.get(callId);
+      if (idx === undefined) {
+        idx = output.content.length;
+        output.content.push({ type: "text", text: "" });
+        toolTextBlocks.set(callId, idx);
+      }
+      return idx;
+    };
+    // Emit one finished text block for a tool call or its result, appended in
+    // the order the app-server reported it so reasoning, tools and the final
+    // answer interleave in the transcript.
+    const emitToolText = (callId: string, markdown: string) => {
+      const idx = toolTextFor(callId);
+      emitDelta(idx, markdown, "text");
+      emitEnd(idx, "text");
+    };
+    // bash: the call block stays OPEN after the `$ cmd` fence opener, so the
+    // result (arriving later as tool.updated) appends into the same block.
+    const openBashToolBlock = (callId: string, markdown: string) => {
+      const idx = toolTextFor(callId);
+      pendingBashBlocks.set(callId, idx);
+      emitDelta(idx, markdown, "text");
+    };
+    const closeBashToolBlock = (callId: string, markdown: string) => {
+      const idx = pendingBashBlocks.get(callId);
+      if (idx === undefined) return;
+      pendingBashBlocks.delete(callId);
+      emitDelta(idx, markdown, "text");
+      emitEnd(idx, "text");
+    };
+    // Close any bash block whose result never arrived (abort/error/timeout).
+    // Function declaration so `finish` (defined above) can call it safely.
+    function flushPendingBashBlocks() {
+      for (const [callId, idx] of [...pendingBashBlocks]) {
+        pendingBashBlocks.delete(callId);
+        emitDelta(idx, "\n```\n", "text");
+        emitEnd(idx, "text");
+      }
+    }
 
     // Live process: model.streaming carries the assistant text, reasoning and
     // tool-call streams in real time; turn.completed delivers the final
@@ -1246,13 +1278,15 @@ function streamSimple(
         return;
       }
       if (ev.type === "tool.updated") {
-        // Tool execution result notifications: stash the result text so the
-        // display-only tool's execute() returns it at turn end (pi then shows
-        // it inside the native tool box). Results that never arrive leave the
-        // box showing only the call.
+        // Tool execution status/result notifications; render results inline
+        // in the order the app-server reports them.
         const callId = pl.toolCallId ?? "";
         if (callId && pl.kind === "result" && pl.result !== undefined) {
-          toolResultsByCall.set(callId, toolResultBody(pl.result));
+          if ((toolNames.get(callId) ?? "").toLowerCase() === "bash" && pendingBashBlocks.has(callId)) {
+            closeBashToolBlock(callId, formatBashResultClose(pl.result));
+          } else {
+            emitToolText(`result:${callId}`, formatToolResult(pl.result));
+          }
         }
         return;
       }
@@ -1291,63 +1325,32 @@ function streamSimple(
       } else if (kind === "reasoning_end") {
         emitEnd(blockFor(key, "thinking"), "thinking");
       } else if (kind === "tool_input_start") {
-        // Open a native pi toolCall block; the box appears live as the args
-        // stream in (tool_input_delta), finalized on tool_input_end/tool_call.
+        // Record the tool name; the call itself is rendered once its args
+        // finalize (tool_input_end / tool_call), in stream order.
         const callId = pl.toolCallId ?? "";
-        if (callId && !toolCallIndex.has(callId)) {
-          const toolName = displayToolName(pl.toolName ?? "tool");
-          toolNames.set(callId, toolName);
-          ensureDisplayTool(extApi, toolName);
-          // Make the no-op tool resolvable for the CURRENT turn too: the loop
-          // snapshotted its tool list before streaming, so push the def into
-          // that same array (context.tools) — otherwise execution reports
-          // "Tool not found" and the model gets re-prompted. Replace any
-          // same-named entry (e.g. a pi tool the zcode name collides with):
-          // in a zcode turn the tool already ran inside ZCode, so pi must
-          // display the result, never execute its own copy.
-          const tools = (context as { tools?: { name: string; description: string; parameters: unknown; execute: unknown }[] }).tools;
-          const def = registeredToolDefs.get(toolName);
-          if (def && Array.isArray(tools)) {
-            const i = tools.findIndex((t) => t.name === toolName);
-            const entry = { name: def.name, description: def.description, parameters: def.parameters, execute: def.execute };
-            if (i >= 0) tools[i] = entry;
-            else tools.push(entry);
-          }
-          const idx = output.content.length;
-          output.content.push({ type: "toolCall", id: callId, name: toolName, arguments: {} });
-          toolCallIndex.set(callId, idx);
-          out.push({ type: "toolcall_start", contentIndex: idx, partial: output });
-        }
+        if (callId) toolNames.set(callId, displayToolName(pl.toolName ?? "tool"));
       } else if (kind === "tool_input_delta") {
+        // Args stream in as JSON; accumulate until finalization.
         const callId = pl.toolCallId ?? "";
         if (callId) {
-          const json = (partialJson.get(callId) ?? "") + (pl.delta ?? "");
-          partialJson.set(callId, json);
-          const idx = toolCallIndex.get(callId);
-          if (idx !== undefined) {
-            (output.content[idx] as ToolCall).arguments = parsePartialJson(json);
-            out.push({ type: "toolcall_delta", contentIndex: idx, delta: pl.delta ?? "", partial: output });
-          }
+          partialJson.set(callId, (partialJson.get(callId) ?? "") + (pl.delta ?? ""));
         }
       } else if (kind === "tool_input_end" || kind === "tool_call") {
         // The app-server emits both tool_input_end and tool_call per call;
-        // finalize the block once, preferring the authoritative input.
+        // render the call once, preferring the authoritative input.
         const callId = pl.toolCallId ?? "";
-        const idx = callId ? toolCallIndex.get(callId) : undefined;
-        if (callId && idx !== undefined && !finalizedTools.has(callId)) {
+        if (callId && !finalizedTools.has(callId)) {
           finalizedTools.add(callId);
           const args =
             kind === "tool_call" && pl.input !== undefined
               ? normalizeToolInput(pl.input)
               : parsePartialJson(partialJson.get(callId) ?? "");
-          const toolName = toolNames.get(callId) ?? displayToolName(pl.toolName ?? "tool");
-          (output.content[idx] as ToolCall).arguments = args;
-          out.push({
-            type: "toolcall_end",
-            contentIndex: idx,
-            toolCall: { type: "toolCall", id: callId, name: toolName, arguments: args },
-            partial: output,
-          });
+          const name = toolNames.get(callId) ?? displayToolName(pl.toolName ?? "tool");
+          if (name.toLowerCase() === "bash") {
+            openBashToolBlock(callId, formatBashCallOpen(args));
+          } else {
+            emitToolText(`call:${callId}`, formatToolCall(name, args));
+          }
         }
       }
     };
@@ -1548,12 +1551,6 @@ function toPiModels(catalog: CatalogModel[]) {
 }
 
 export default function (pi: ExtensionAPI) {
-  extApi = pi;
-  // Register the display-only no-op tools up front so every zcode tool call
-  // renders as a native pi tool box from the first turn (and pi never tries
-  // to execute ZCode's tools itself). Unknown tool names are registered lazily
-  // in streamSimple on first sight.
-  for (const name of ZCODE_TOOL_NAMES) ensureDisplayTool(pi, name);
   mergeV2Providers();
   // Capture the pi UI context so interaction/requestUserInput (askUserQuestion)
   // can show its dialog from the app-server's request handler.

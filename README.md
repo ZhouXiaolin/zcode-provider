@@ -4,10 +4,10 @@ Turn the **ZCode** agent (`zcodex app-server`, an OpenCode-derived CLI agent) in
 pi model provider. pi is the chat frontend; the ZCode agent keeps its own
 session, runs its own tools (bash, edits, plugins, ...), and its reply is
 streamed back into pi in real time — the reasoning, the tool calls and the
-final text all arrive as they happen, not as one chunk at the end. Tool calls
-and their results render as pi's **native tool boxes** (ZCode executes them;
-pi only displays them, via display-only no-op tools that hand the already-
-produced result back to pi's standard tool renderer).
+final text all arrive as they happen, not as one chunk at the end. Reasoning,
+text, tool calls and their results are rendered **inline, interleaved in the
+exact order ZCode produced them** (ZCode executes the tools itself; pi only
+displays the call/results as formatted transcript blocks).
 
 Each ZCode provider/model configured in ZCode becomes a selectable pi model, and
 the list auto-syncs from ZCode's config — no hardcoded model list, no pi reload
@@ -174,33 +174,30 @@ questions: ...").
   and `tool.updated` events after `session/subscribe`); deltas arrive chunked,
   and the final text is also reconciled from the messages store when no live
   deltas were seen (e.g. subscription failed).
-- Tool calls are **display-only, rendered as native pi tool boxes**. ZCode runs
-  them inside its own session; the bridge emits real pi `toolCall` content
-  blocks (the call streams into the box live as ZCode streams its arguments)
-  and registers a matching display-only tool per name whose `execute()` returns
-  the result ZCode already produced with `terminate: true` — pi renders the
-  call + result in its standard `ToolExecutionComponent` (colored box,
-  `toolTitle`/`toolOutput` styling, expand/collapse) and, because every result
-  in the batch terminates, never re-prompt the model or re-run the tool. Tool
-  results are stashed from `tool.updated` notifications and shown when the
-  turn completes; a tool whose result never arrived (e.g. the turn was cut
-  short) shows only the call. The registered no-op tools override pi builtins
-  of the same name (e.g. `Bash`) in the session — correct here, since the
-  ZCode model never uses pi's tool implementations.
+- Tool calls are **display-only, rendered inline in stream order**. ZCode runs
+  them inside its own session; the bridge never emits pi `toolCall` blocks
+  (pi's harness would try to execute them itself, and pi's TUI renders every
+  `toolCall` block as a box appended *below* the assistant message — splitting
+  the transcript into a text part on top and a tool part below). Instead each
+  tool call (`model.streaming` `tool_input_*`) and its result (`tool.updated`
+  `kind=result`) are rendered as formatted markdown text blocks appended in
+  the exact order the app-server reports them, so reasoning, tools, results
+  and the final answer interleave in the transcript like ZCode's own output:
+  thinking block → text block → tool call → tool result → next thinking
+  block → … Each tool call renders as `**🔧 Name** — summary` (one-line
+  command/path summary for the common tools, fenced JSON for complex args,
+  the question text for `askUserQuestion`); each result renders as a fenced
+  text block capped at 6k chars with truncation and failure markers. Bash
+  calls merge command + output into a single fenced block (`$ cmd` first line,
+  echoing pi's native bash display). A turn that ends with a bash call whose
+  result never arrived (aborted/timeout) closes the fence so every block
+  stays well-formed.
 - **MCP / skill / plugin tools are handled too**. ZCode namespaces MCP tools as
   `mcp__<server>__<tool>` (e.g. `mcp__codegraph__codegraph_explore`); the
-  bridge maps that to a clean display name `<server>__<tool>` for the box
-  title (the double underscore keeps them distinct from pi's own MCP tools,
-  which pi names `<server>_<tool>`, so the no-op tools never shadow pi's own
-  MCP tools). Any tool name not in the pre-registered builtin set is
-  registered lazily on first sight, and the definition is pushed into the
-  current turn's tool snapshot so the running turn can resolve it (pi's loop
-  snapshots its tool list before streaming; without the push it would report
-  "Tool not found" and re-prompt the model). ZCode's own environment — its
-  MCP servers, skills and tools — always runs the real call; pi only mirrors
-  the name, arguments and result text. Tools without a dedicated pi renderer
-  fall back to the generic box (bold name + args + result), which covers
-  anything ZCode may call.
+  bridge maps that to a clean display name `<server>__<tool>` for the inline
+  heading, and any tool name is rendered through the same generic formatter.
+  ZCode's own environment — its MCP servers, skills and tools — always runs
+  the real call; pi only mirrors the name, arguments and result text.
 - pi's RPC/print mode has a model-resolver crash in some pi 0.84.2 builds that
   also affects built-in providers; interactive `/model` is unaffected.
 - The resident-pool eviction cannot be configured from outside the app-server;
