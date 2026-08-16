@@ -107,6 +107,16 @@ idle timeout, LRU beyond 16 sessions) and would otherwise reject stale session
 ids with "Session is not active"; the bridge resumes the persisted session
 before every turn, so multi-turn continuity survives idle gaps.
 
+**Session continuity across pi restarts.** The bridge remembers the ZCode
+session id per pi session (a small sidecar file
+`~/.zcode/cli/zcode-provider-sessions.json`, keyed by pi session UUID). When
+you exit pi and restore the same conversation with `pi --session <id>` (or
+`/resume`), the bridge calls `session/resume` on the remembered ZCode session
+instead of `session/create`, so the ZCode agent keeps its full session history
+(session memory, accumulated context, tool state). A fresh pi session in the
+same project, or a restore from a different working directory, still gets a
+new ZCode session as before.
+
 ## Updates while a turn is running
 
 Messages typed in pi while the ZCode agent is mid-task are delivered using

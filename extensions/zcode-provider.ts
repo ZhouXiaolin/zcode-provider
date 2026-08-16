@@ -397,6 +397,72 @@ let sessionId: string | null = null;
 let lastModelId: string | null = null;
 let probeLog: ((line: string) => void) | null = null;
 
+// ---- ZCode session continuity across pi restarts ----
+// sessionId above is in-memory only: when pi exits it is lost, and a restore
+// (`pi --session <id>` / `/resume`) would run session/create and get a
+// brand-new ZCode session with none of the agent's accumulated context. The
+// app-server persists sessions in its own SQLite store (session/resume
+// rehydrates them even after the app-server restarted with pi), so remember
+// the zcode sessionId per pi session UUID in a small sidecar file next to the
+// settings file and resume it on restore.
+const SESSION_MAP_PATH = `${dirname(SETTINGS_PATH)}/zcode-provider-sessions.json`;
+const SESSION_MAP_MAX_ENTRIES = 32;
+let piSessionId: string | null = null; // pi session UUID, captured at session_start
+
+interface RememberedSession {
+  sessionId: string;
+  workspacePath: string;
+  updatedAt: string;
+}
+
+function loadSessionMap(): Record<string, RememberedSession> {
+  try {
+    return JSON.parse(readFileSync(SESSION_MAP_PATH, "utf8")) as Record<
+      string,
+      RememberedSession
+    >;
+  } catch {
+    return {};
+  }
+}
+
+// Persist (or refresh) the zcode sessionId for the current pi session. The map
+// is bounded: oldest entries (by last update) are dropped past the cap.
+function rememberSession(sid: string, workspacePath: string): void {
+  if (!piSessionId) return;
+  try {
+    const map = loadSessionMap();
+    map[piSessionId] = {
+      sessionId: sid,
+      workspacePath,
+      updatedAt: new Date().toISOString(),
+    };
+    const entries = Object.entries(map).sort((a, b) =>
+      a[1].updatedAt < b[1].updatedAt ? -1 : 1,
+    );
+    for (const [key] of entries.slice(
+      0,
+      Math.max(0, entries.length - SESSION_MAP_MAX_ENTRIES),
+    )) {
+      delete map[key];
+    }
+    writeFileSync(SESSION_MAP_PATH, JSON.stringify(map, null, 2) + "\n");
+  } catch {
+    /* best-effort: without the mapping the next restore starts a fresh zcode
+       session (the pre-fix behavior), never a hard failure */
+  }
+}
+
+// The zcode session this pi session used before, if any and if it still points
+// at the same workspace (a restored pi session runs in the cwd it was created
+// in; a different cwd is a different project, so a fresh session is correct).
+function rememberedSessionId(): string | null {
+  if (!piSessionId) return null;
+  const entry = loadSessionMap()[piSessionId];
+  if (!entry || entry.workspacePath !== process.cwd()) return null;
+  return entry.sessionId;
+}
+
 // Guide-steer state (ZCODE_STEER_MODE=guide): whether a ZCode turn is
 // currently running (pi input events during it can be injected live) and the
 // v4 publisher facts needed for the setFollowupMode CAS command.
@@ -1291,11 +1357,30 @@ function streamSimple(
     try {
       ref = resolveModelRef(model.id);
       if (!sessionId) {
-        const created = await request<{ session: { sessionId: string } }>("session/create", {
-          workspace: { workspacePath: process.cwd(), workspaceKey: process.cwd() },
-        });
-        sessionId = created.session.sessionId;
-        lastModelId = null;
+        // pi restarted / session restored (`pi --session`): continue the zcode
+        // session this pi session used before instead of silently creating a
+        // fresh one. The app-server persisted it, so resume rehydrates it even
+        // though the app-server process restarted along with pi.
+        const remembered = rememberedSessionId();
+        if (remembered) {
+          try {
+            await request("session/resume", { sessionId: remembered });
+            sessionId = remembered;
+            lastModelId = null;
+          } catch {
+            // Session no longer exists server-side (store cleared/purged):
+            // fall through to a fresh create.
+            sessionId = null;
+          }
+        }
+        if (!sessionId) {
+          const created = await request<{ session: { sessionId: string } }>("session/create", {
+            workspace: { workspacePath: process.cwd(), workspaceKey: process.cwd() },
+          });
+          sessionId = created.session.sessionId;
+          lastModelId = null;
+          rememberSession(sessionId, process.cwd());
+        }
       } else {
         // The app-server evicts idle sessions from memory (resident pool:
         // idleTimeoutMs 600s by default, plus LRU over 16 sessions) and then
@@ -1474,6 +1559,11 @@ export default function (pi: ExtensionAPI) {
   // can show its dialog from the app-server's request handler.
   pi.on("session_start", (_event, ctx) => {
     uiCtx = ctx;
+    // The pi session UUID is stable across `pi --session <id>` restores; the
+    // zcode sessionId mapping is keyed by it so a restored pi session resumes
+    // its own ZCode session instead of silently creating a fresh one.
+    piSessionId =
+      ctx.sessionManager?.getSessionId() ?? ctx.sessionManager?.getSessionFile() ?? null;
   });
   pi.registerProvider("zcode", {
     name: "ZCode (app-server)",
@@ -1554,6 +1644,10 @@ export default function (pi: ExtensionAPI) {
     runningTasksBySession.clear();
     if (sessionId) {
       try {
+        // Close persists the session in the app-server's store; the sidecar
+        // mapping (see rememberSession) is intentionally NOT cleared, so a
+        // `pi --session` restore resumes this zcode session instead of
+        // creating a new one.
         await request("session/close", { sessionId });
       } catch {
         /* server may already be gone */
