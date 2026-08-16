@@ -55,7 +55,6 @@ import type {
   Context,
   Model,
   SimpleStreamOptions,
-  ToolCall,
 } from "@earendil-works/pi-ai";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { InputEventResult } from "@earendil-works/pi-coding-agent";
@@ -474,7 +473,10 @@ interface ZcodeMessage {
 //       reasoning_delta|reasoning_end|tool_input_start|tool_input_delta|
 //       tool_input_end|tool_call, delta?, input?, assistantMessageId?,
 //       toolCallId?, toolName?}
-//   turn.completed:  {response}   turn.failed: {reason}
+//   tool.updated:   {toolCallId, toolName, kind: scheduled|started|result|
+//       batch, result?: {success, content, truncated}}  (tool execution status
+//       and output; the bridge renders these inline in the transcript)
+//   turn.completed: {response}   turn.failed: {reason}
 interface ZcodeStreamEvent {
   type: string;
   payload?: {
@@ -486,7 +488,14 @@ interface ZcodeStreamEvent {
     toolName?: string;
     reason?: string;
     response?: string;
+    result?: ZcodeToolResult;
   };
+}
+
+interface ZcodeToolResult {
+  success?: boolean;
+  content?: unknown;
+  truncated?: boolean;
 }
 
 function parsePartialJson(s: string): Record<string, unknown> {
@@ -505,6 +514,74 @@ function normalizeToolInput(input: unknown): Record<string, unknown> {
     return input as Record<string, unknown>;
   }
   return typeof input === "string" ? parsePartialJson(input) : {};
+}
+
+// ---- Tool display helpers. ZCode executes its own tools inside its session,
+// so the bridge never emits pi toolCall blocks (the pi harness would try to
+// execute them itself and re-prompt the model). Each tool call and its result
+// are rendered as inline markdown text blocks in stream order, which lets
+// reasoning, tools and the final answer interleave in the pi transcript.
+
+function escapeInlineCode(s: string): string {
+  return s.replace(/`/g, "\\`").replace(/\s*\n\s*/g, " ");
+}
+
+// One-line summary of the arguments for the common ZCode tools; null when the
+// args are too complex to summarize (the call falls back to a JSON block).
+function toolArgsSummary(name: string, args: Record<string, unknown>): string | null {
+  const cmd = args.command;
+  if (typeof cmd === "string" && cmd.trim()) return cmd.trim();
+  for (const key of ["filePath", "file_path", "path", "file"]) {
+    const v = args[key];
+    if (typeof v === "string" && v.trim()) return v.trim();
+  }
+  const keys = Object.keys(args);
+  if (keys.length === 1) {
+    const v = args[keys[0]];
+    if (typeof v === "string" && v.trim()) return v.trim();
+  }
+  return null;
+}
+
+function formatToolCall(name: string, args: Record<string, unknown>): string {
+  const header = `**🔧 ${name}**`;
+  const summary = toolArgsSummary(name, args);
+  if (summary) return `${header} — \`${escapeInlineCode(summary)}\``;
+  const keys = Object.keys(args);
+  if (keys.length === 0) return header;
+  return `${header}\n\n\`\`\`json\n${JSON.stringify(args, null, 2)}\n\`\`\``;
+}
+
+// Cap displayed tool output so a huge result does not flood the transcript.
+const MAX_RESULT_CHARS = 6000;
+
+function toolResultContent(result: ZcodeToolResult): string {
+  const content = result.content;
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) {
+    return content
+      .map((c) =>
+        c && typeof c === "object" ? ((c as { text?: string }).text ?? "") : String(c),
+      )
+      .filter(Boolean)
+      .join("\n");
+  }
+  return content === undefined || content === null
+    ? ""
+    : JSON.stringify(content, null, 2);
+}
+
+function formatToolResult(result: ZcodeToolResult): string {
+  let text = toolResultContent(result);
+  if (!text.trim()) text = result.success === false ? "Tool failed" : "";
+  if (!text.trim()) return "";
+  let body = text;
+  if (body.length > MAX_RESULT_CHARS) {
+    body = body.slice(0, MAX_RESULT_CHARS) + `\n… (${body.length - MAX_RESULT_CHARS} more chars)`;
+  }
+  if (result.truncated) body += "\n… (truncated by ZCode)";
+  const marker = result.success === false ? "**⚠️ Tool failed**\n\n" : "";
+  return `${marker}\`\`\`text\n${body}\n\`\`\``;
 }
 
 // The app-server does not emit the final text until prompt_completed, but
@@ -675,9 +752,13 @@ function streamSimple(
     // ---- Live-stream bookkeeping. The app-server can batch away the
     // *_start markers of a stream, so every event must be able to lazily
     // create its content block; deltas append and *_end finalize. Blocks are
-    // keyed by assistantMessageId (text/reasoning) or toolCallId (tool calls).
+    // keyed by assistantMessageId (text/reasoning). ZCode runs its own tools,
+    // so tool calls/results are rendered inline as text blocks (keyed by
+    // toolCallId) instead of toolCall blocks — pi would otherwise execute them.
     const msgBlocks = new Map<string, { text?: number; thinking?: number }>();
-    const toolBlocks = new Map<string, number>();
+    const toolTextBlocks = new Map<string, number>();
+    const toolNames = new Map<string, string>();
+    const finalizedTools = new Set<string>();
     const started = new Set<number>();
     const ended = new Set<number>();
     const partialJson = new Map<string, string>();
@@ -702,25 +783,20 @@ function streamSimple(
       }
       return idx;
     };
-    const toolFor = (callId: string, toolName: string): number => {
-      let idx = toolBlocks.get(callId);
+    const toolTextFor = (callId: string): number => {
+      let idx = toolTextBlocks.get(callId);
       if (idx === undefined) {
         idx = output.content.length;
-        output.content.push({
-          type: "toolCall",
-          id: callId,
-          name: toolName,
-          arguments: {},
-        });
-        toolBlocks.set(callId, idx);
+        output.content.push({ type: "text", text: "" });
+        toolTextBlocks.set(callId, idx);
       }
       return idx;
     };
-    const emitStart = (idx: number, kind: "text" | "thinking" | "toolcall") => {
+    const emitStart = (idx: number, kind: "text" | "thinking") => {
       if (started.has(idx)) return;
       started.add(idx);
       out.push({
-        type: kind === "toolcall" ? "toolcall_start" : kind === "text" ? "text_start" : "thinking_start",
+        type: kind === "text" ? "text_start" : "thinking_start",
         contentIndex: idx,
         partial: output,
       });
@@ -737,25 +813,24 @@ function streamSimple(
         partial: output,
       });
     };
-    const emitEnd = (idx: number, kind: "text" | "thinking" | "toolcall") => {
+    const emitEnd = (idx: number, kind: "text" | "thinking") => {
       if (ended.has(idx)) return;
       ended.add(idx);
       const block = blockAt(idx);
-      if (kind === "toolcall") {
-        out.push({
-          type: "toolcall_end",
-          contentIndex: idx,
-          toolCall: block as ToolCall,
-          partial: output,
-        });
-      } else {
-        out.push({
-          type: kind === "text" ? "text_end" : "thinking_end",
-          contentIndex: idx,
-          content: kind === "text" ? (block as { text: string }).text : (block as { thinking: string }).thinking,
-          partial: output,
-        });
-      }
+      out.push({
+        type: kind === "text" ? "text_end" : "thinking_end",
+        contentIndex: idx,
+        content: kind === "text" ? (block as { text: string }).text : (block as { thinking: string }).thinking,
+        partial: output,
+      });
+    };
+    // Emit one finished text block for a tool call or its result, appended in
+    // the order the app-server reported it so reasoning, tools and the final
+    // answer interleave.
+    const emitToolText = (callId: string, markdown: string) => {
+      const idx = toolTextFor(callId);
+      emitDelta(idx, markdown, "text");
+      emitEnd(idx, "text");
     };
 
     // Live process: model.streaming carries the assistant text, reasoning and
@@ -788,6 +863,14 @@ function streamSimple(
         turnSettled = true;
         return;
       }
+      if (ev.type === "tool.updated") {
+        // Tool execution status/result notifications; render results inline.
+        const callId = pl.toolCallId ?? "";
+        if (callId && pl.kind === "result" && pl.result !== undefined) {
+          emitToolText(`result:${callId}`, formatToolResult(pl.result));
+        }
+        return;
+      }
       if (ev.type !== "model.streaming") return;
       const kind = pl.kind;
       const key = pl.assistantMessageId ?? "";
@@ -806,28 +889,30 @@ function streamSimple(
       } else if (kind === "reasoning_end") {
         emitEnd(blockFor(key, "thinking"), "thinking");
       } else if (kind === "tool_input_start") {
-        emitStart(toolFor(pl.toolCallId ?? "", pl.toolName ?? "tool"), "toolcall");
+        // Tool-call args stream in as JSON; nothing is emitted until they
+        // finalize (tool_input_end / tool_call), then one text block appears.
+        const callId = pl.toolCallId ?? "";
+        if (callId) toolNames.set(callId, pl.toolName ?? "tool");
       } else if (kind === "tool_input_delta") {
         const callId = pl.toolCallId ?? "";
-        const acc = (partialJson.get(callId) ?? "") + (pl.delta ?? "");
-        partialJson.set(callId, acc);
-        const idx = toolFor(callId, pl.toolName ?? "tool");
-        const block = blockAt(idx) as ToolCall;
-        block.arguments = parsePartialJson(acc);
-        emitStart(idx, "toolcall");
-        out.push({ type: "toolcall_delta", contentIndex: idx, delta: pl.delta ?? "", partial: output });
-      } else if (kind === "tool_input_end" || kind === "tool_call") {
-        const callId = pl.toolCallId ?? "";
-        const idx = toolFor(callId, pl.toolName ?? "tool");
-        const block = blockAt(idx) as ToolCall;
-        if (kind === "tool_call" && pl.input !== undefined) {
-          block.arguments = normalizeToolInput(pl.input);
-        } else {
-          const acc = partialJson.get(callId);
-          if (acc !== undefined) block.arguments = parsePartialJson(acc);
+        if (callId) {
+          partialJson.set(callId, (partialJson.get(callId) ?? "") + (pl.delta ?? ""));
         }
-        emitStart(idx, "toolcall");
-        emitEnd(idx, "toolcall");
+      } else if (kind === "tool_input_end" || kind === "tool_call") {
+        // The app-server emits both tool_input_end and tool_call per call;
+        // render the call block once, preferring the authoritative input.
+        const callId = pl.toolCallId ?? "";
+        if (callId && !finalizedTools.has(callId)) {
+          finalizedTools.add(callId);
+          const args =
+            kind === "tool_call" && pl.input !== undefined
+              ? normalizeToolInput(pl.input)
+              : parsePartialJson(partialJson.get(callId) ?? "");
+          emitToolText(
+            `call:${callId}`,
+            formatToolCall(toolNames.get(callId) ?? pl.toolName ?? "tool", args),
+          );
+        }
       }
     };
 

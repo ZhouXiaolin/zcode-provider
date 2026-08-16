@@ -4,7 +4,9 @@ Turn the **ZCode** agent (`zcodex app-server`, an OpenCode-derived CLI agent) in
 pi model provider. pi is the chat frontend; the ZCode agent keeps its own
 session, runs its own tools (bash, edits, plugins, ...), and its reply is
 streamed back into pi in real time — the reasoning, the tool calls and the
-final text all arrive as they happen, not as one chunk at the end.
+final text all arrive as they happen, not as one chunk at the end. Tool calls
+and their results are rendered inline in the transcript in output order
+(ZCode executes them; pi only displays them).
 
 Each ZCode provider/model configured in ZCode becomes a selectable pi model, and
 the list auto-syncs from ZCode's config — no hardcoded model list, no pi reload
@@ -130,9 +132,14 @@ Messages typed in pi while the ZCode agent is mid-task are delivered using
   The pi stream stays open until the task completes. Stopping the turn in pi
   aborts the server-side turn too.
 - The app-server streams reasoning, tool calls and text live (`model.streaming`
-  events after `session/subscribe`); deltas arrive chunked, and the final text
-  is also reconciled from the messages store when no live deltas were seen
-  (e.g. subscription failed).
+  and `tool.updated` events after `session/subscribe`); deltas arrive chunked,
+  and the final text is also reconciled from the messages store when no live
+  deltas were seen (e.g. subscription failed).
+- Tool calls are **display-only**: ZCode runs them inside its own session, and
+  the bridge renders each call + result as an inline markdown block in stream
+  order, so reasoning, tools and the final answer interleave in the transcript.
+  pi never receives `toolCall` blocks — the pi harness would otherwise try to
+  execute ZCode's tools itself and re-prompt the model.
 - pi's RPC/print mode has a model-resolver crash in some pi 0.84.2 builds that
   also affects built-in providers; interactive `/model` is unaffected.
 - The resident-pool eviction cannot be configured from outside the app-server;
