@@ -5,8 +5,9 @@ pi model provider. pi is the chat frontend; the ZCode agent keeps its own
 session, runs its own tools (bash, edits, plugins, ...), and its reply is
 streamed back into pi in real time — the reasoning, the tool calls and the
 final text all arrive as they happen, not as one chunk at the end. Tool calls
-and their results are rendered inline in the transcript in output order
-(ZCode executes them; pi only displays them).
+and their results render as pi's **native tool boxes** (ZCode executes them;
+pi only displays them, via display-only no-op tools that hand the already-
+produced result back to pi's standard tool renderer).
 
 Each ZCode provider/model configured in ZCode becomes a selectable pi model, and
 the list auto-syncs from ZCode's config — no hardcoded model list, no pi reload
@@ -71,7 +72,7 @@ Environment variables (set before starting pi):
 | `ZCODE_V2_CONFIG` | `~/.zcode/v2/config.json` | ZCode UI config whose enabled providers are merged in |
 | `ZCODE_AUTO_ALLOW` | `1` (enabled) | Auto-answer ZCode permission prompts. Set to `0` to deny tool permission requests |
 | `ZCODE_TURN_TIMEOUT_MS` | `1800000` (30 min) | Per-turn budget. On timeout the bridge interrupts the turn (`session/stop`) and sends the session `go on`, so long tasks keep progressing instead of failing. Raise it for turns that need to run longer uninterrupted |
-| `ZCODE_STEER_MODE` | `queue` | How a message typed in pi while a ZCode turn is running is handled, using ZCode's own two delivery modes: `queue` (processed as a new turn after the current one completes — pi's standard behavior) or `guide` (sent to the running session via ZCode's v4 command channel and injected at the next tool/message boundary inside the same turn, falling back to a queue when the turn is not steerable) |
+| `ZCODE_STEER_MODE` | auto | How a message typed in pi while a ZCode turn is running is handled, using ZCode's own two delivery modes: `queue` (processed as a new turn after the current one completes — pi's standard behavior) or `guide` (sent to the running session via ZCode's v4 command channel and injected at the next tool/message boundary inside the same turn, falling back to a queue when the turn is not steerable). Default follows ZCode's own UI setting (`zcodeInteractionBehavior` in `~/.zcode/v2/setting.json`): `guide` when ZCode is configured for guide-mode interaction, else `queue`. Set explicitly to override |
 
 ## Security
 
@@ -111,18 +112,24 @@ before every turn, so multi-turn continuity survives idle gaps.
 Messages typed in pi while the ZCode agent is mid-task are delivered using
 **ZCode's own two delivery modes** (its `followupMode` setting):
 
-- `ZCODE_STEER_MODE=queue` (default): pi queues the message and runs it as a
-  new ZCode turn once the current one completes — nothing is injected mid-run.
-  This is ZCode's `queue` followupMode and pi's standard model-provider flow.
-- `ZCODE_STEER_MODE=guide`: the bridge enables ZCode's `guide` followupMode on
-  the session (v4 conversation subscription + CAS `setFollowupMode`) and hooks
-  pi's `input` event. A message typed while the turn is running is sent to the
+- `queue`: pi queues the message and runs it as a new ZCode turn once the
+  current one completes — nothing is injected mid-run. This is ZCode's `queue`
+  followupMode and pi's standard model-provider flow.
+- `guide`: the bridge enables ZCode's `guide` followupMode on the session
+  (v4 conversation subscription + CAS `setFollowupMode`) and hooks pi's
+  `input` event. A message typed while the turn is running is sent to the
   running session via the v4 `sendText` command; ZCode injects it at the next
   tool/message boundary **inside the same turn** (`turn.steerQueued` →
   `turn.steerDrained`), falling back to a queue when the turn is not steerable
   or already has queued input. pi marks the message as handled, so it is not
   duplicated into the next turn. The steered run's reply streams into pi as
   usual.
+
+Which mode applies is decided by `ZCODE_STEER_MODE`: an explicit
+`ZCODE_STEER_MODE=guide` / `=queue` wins, otherwise the bridge follows ZCode's
+own UI setting (`zcodeInteractionBehavior` in `~/.zcode/v2/setting.json`). If
+your ZCode desktop app is set to guide-mode interaction (its default is
+`queue`), pi steers too — no extra env var needed.
 
 ## Asking you questions (ZCode's `askUserQuestion`)
 
@@ -149,19 +156,41 @@ questions: ...").
   checkpointed: the bridge interrupts it (`session/stop`) and sends the session
   `go on`, so the ZCode agent continues the task with its full session history.
   The pi stream stays open until the task completes. Stopping the turn in pi
-  aborts the server-side turn too.
+  aborts the server-side turn too, and cancels any background tasks
+  (`run_in_background` bash etc.) the agent started in the session — ZCode's
+  own stop leaves those running, so the bridge stops them explicitly
+  (`session/cancelBackgroundTask` per running task).
 - The app-server streams reasoning, tool calls and text live (`model.streaming`
   and `tool.updated` events after `session/subscribe`); deltas arrive chunked,
   and the final text is also reconciled from the messages store when no live
   deltas were seen (e.g. subscription failed).
-- Tool calls are **display-only**: ZCode runs them inside its own session, and
-  the bridge renders each call + result as inline markdown in stream order, so
-  reasoning, tools and the final answer interleave in the transcript. bash
-  calls merge command + output into a single ```` ```text ```` block (first line
-  `$ cmd`), echoing pi's native bash rendering; other tools render as a
-  `🔧 name` header line plus a result block. pi never receives `toolCall`
-  blocks — the pi harness would otherwise try to execute ZCode's tools itself
-  and re-prompt the model.
+- Tool calls are **display-only, rendered as native pi tool boxes**. ZCode runs
+  them inside its own session; the bridge emits real pi `toolCall` content
+  blocks (the call streams into the box live as ZCode streams its arguments)
+  and registers a matching display-only tool per name whose `execute()` returns
+  the result ZCode already produced with `terminate: true` — pi renders the
+  call + result in its standard `ToolExecutionComponent` (colored box,
+  `toolTitle`/`toolOutput` styling, expand/collapse) and, because every result
+  in the batch terminates, never re-prompt the model or re-run the tool. Tool
+  results are stashed from `tool.updated` notifications and shown when the
+  turn completes; a tool whose result never arrived (e.g. the turn was cut
+  short) shows only the call. The registered no-op tools override pi builtins
+  of the same name (e.g. `Bash`) in the session — correct here, since the
+  ZCode model never uses pi's tool implementations.
+- **MCP / skill / plugin tools are handled too**. ZCode namespaces MCP tools as
+  `mcp__<server>__<tool>` (e.g. `mcp__codegraph__codegraph_explore`); the
+  bridge maps that to a clean display name `<server>__<tool>` for the box
+  title (the double underscore keeps them distinct from pi's own MCP tools,
+  which pi names `<server>_<tool>`, so the no-op tools never shadow pi's own
+  MCP tools). Any tool name not in the pre-registered builtin set is
+  registered lazily on first sight, and the definition is pushed into the
+  current turn's tool snapshot so the running turn can resolve it (pi's loop
+  snapshots its tool list before streaming; without the push it would report
+  "Tool not found" and re-prompt the model). ZCode's own environment — its
+  MCP servers, skills and tools — always runs the real call; pi only mirrors
+  the name, arguments and result text. Tools without a dedicated pi renderer
+  fall back to the generic box (bold name + args + result), which covers
+  anything ZCode may call.
 - pi's RPC/print mode has a model-resolver crash in some pi 0.84.2 builds that
   also affects built-in providers; interactive `/model` is unaffected.
 - The resident-pool eviction cannot be configured from outside the app-server;
