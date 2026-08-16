@@ -56,8 +56,16 @@ import type {
   Model,
   SimpleStreamOptions,
 } from "@earendil-works/pi-ai";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { InputEventResult } from "@earendil-works/pi-coding-agent";
+import {
+  Editor,
+  type EditorTheme,
+  Key,
+  matchesKey,
+  visibleWidth,
+  wrapTextWithAnsi,
+} from "@earendil-works/pi-tui";
 import { spawn, type ChildProcess } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { copyFileSync, existsSync, readFileSync, watch, writeFileSync } from "node:fs";
@@ -375,6 +383,10 @@ let probeLog: ((line: string) => void) | null = null;
 // currently running (pi input events during it can be injected live) and the
 // v4 publisher facts needed for the setFollowupMode CAS command.
 let turnActive = false;
+// The pi UI context, captured at session_start. Used to show the question
+// dialog when the ZCode app-server asks the user (interaction/requestUserInput,
+// the model's askUserQuestion tool) and pass the answer back into the session.
+let uiCtx: ExtensionContext | null = null;
 const guideSessions = new Set<string>();
 const v4StateBySession = new Map<
   string,
@@ -435,6 +447,11 @@ function startServer(): void {
           result: { decision: allow ? "allow" : "deny", reason: "pi zcode bridge" },
         }) + "\n",
       );
+    } else if (msg.method === "interaction/requestUserInput") {
+      // ZCode's askUserQuestion tool: the model asks the user. Show the
+      // question dialog in pi and answer with the user's choice so the ZCode
+      // agent continues in the same session.
+      void handleUserInputInteraction(msg);
     }
     for (const l of listeners) l(msg);
   });
@@ -529,6 +546,14 @@ function escapeInlineCode(s: string): string {
 // One-line summary of the arguments for the common ZCode tools; null when the
 // args are too complex to summarize (the call falls back to a JSON block).
 function toolArgsSummary(name: string, args: Record<string, unknown>): string | null {
+  if (name === "askUserQuestion") {
+    const qs = args.questions;
+    if (Array.isArray(qs) && qs.length > 0) {
+      const first = qs[0] as { question?: string; header?: string };
+      const label = first?.question || first?.header || "";
+      if (label) return qs.length === 1 ? label : `${label} (+${qs.length - 1} more)`;
+    }
+  }
   const cmd = args.command;
   if (typeof cmd === "string" && cmd.trim()) return cmd.trim();
   for (const key of ["filePath", "file_path", "path", "file"]) {
@@ -552,6 +577,15 @@ function formatToolCall(name: string, args: Record<string, unknown>): string {
   return `${header}\n\n\`\`\`json\n${JSON.stringify(args, null, 2)}\n\`\`\``;
 }
 
+// bash calls merge command + result into ONE fenced block, echoing pi's
+// native `$ cmd` + output rendering (the bridge cannot emit real toolCall
+// blocks because ZCode executes the tools itself). The call opens the fence
+// with the command; the result appends the output and closes it.
+function formatBashCallOpen(args: Record<string, unknown>): string {
+  const cmd = typeof args.command === "string" ? args.command.trim() : "";
+  return "```text\n$ " + (cmd || "(no command)") + "\n";
+}
+
 // Cap displayed tool output so a huge result does not flood the transcript.
 const MAX_RESULT_CHARS = 6000;
 
@@ -571,7 +605,7 @@ function toolResultContent(result: ZcodeToolResult): string {
     : JSON.stringify(content, null, 2);
 }
 
-function formatToolResult(result: ZcodeToolResult): string {
+function toolResultBody(result: ZcodeToolResult): string {
   let text = toolResultContent(result);
   if (!text.trim()) text = result.success === false ? "Tool failed" : "";
   if (!text.trim()) return "";
@@ -580,8 +614,255 @@ function formatToolResult(result: ZcodeToolResult): string {
     body = body.slice(0, MAX_RESULT_CHARS) + `\n… (${body.length - MAX_RESULT_CHARS} more chars)`;
   }
   if (result.truncated) body += "\n… (truncated by ZCode)";
+  return body;
+}
+
+function formatToolResult(result: ZcodeToolResult): string {
+  const body = toolResultBody(result);
+  if (!body) return "";
   const marker = result.success === false ? "**⚠️ Tool failed**\n\n" : "";
   return `${marker}\`\`\`text\n${body}\n\`\`\``;
+}
+
+// Appended inside the merged bash fence: blank line, then the output, then
+// the closing fence. Failure is marked with a plain line (markdown inside a
+// ```text fence is not rendered).
+function formatBashResultClose(result: ZcodeToolResult): string {
+  const body = toolResultBody(result);
+  if (!body) return "\n```\n";
+  const marker = result.success === false ? "⚠️ Tool failed\n" : "";
+  return `\n${marker}${body}\n\`\`\`\n`;
+}
+
+// ---- interaction/requestUserInput (ZCode askUserQuestion) ----
+// The app-server asks the connected client to collect answers from the user
+// (the model called its askUserQuestion tool, 1-4 questions each with
+// header/question/options[2-4]/multiSelect). Show pi's question dialog, then
+// answer the request so the ZCode agent resumes with the user's choices.
+// Response content: {answer} for one question, {answers: {question: ans}}
+// for several (the server maps them back; multiSelect label arrays join ", ").
+
+interface ZcodeWireOption {
+  value?: string;
+  label: string;
+  description?: string;
+  preview?: string;
+}
+interface ZcodeWireQuestion {
+  question: string;
+  header?: string;
+  options?: ZcodeWireOption[];
+  multiSelect?: boolean;
+}
+
+async function handleUserInputInteraction(msg: {
+  id: string;
+  params?: { questions?: ZcodeWireQuestion[]; prompt?: string };
+}): Promise<void> {
+  const respond = (result: unknown) => {
+    if (!proc?.stdin) return;
+    proc.stdin.write(JSON.stringify({ id: msg.id, result }) + "\n");
+  };
+  try {
+    const questions = Array.isArray(msg.params?.questions) ? msg.params.questions : [];
+    if (questions.length === 0) throw new Error("no questions in interaction");
+    const content = await askQuestionsInPi(questions);
+    respond({ action: "accept", content });
+  } catch {
+    respond({ action: "cancel", reason: "cancelled by user in pi" });
+  }
+}
+
+type QuestionAnswer = string | string[];
+
+async function askQuestionsInPi(questions: ZcodeWireQuestion[]): Promise<Record<string, unknown>> {
+  const ctx = uiCtx;
+  if (!ctx || ctx.mode !== "tui") throw new Error("no interactive pi UI");
+  if (questions.length === 1) {
+    const ans = await askOneQuestionInPi(ctx, questions[0]);
+    if (ans === null) throw new Error("cancelled");
+    return { answer: ans };
+  }
+  const answers: Record<string, QuestionAnswer> = {};
+  for (const q of questions) {
+    const ans = await askOneQuestionInPi(ctx, q);
+    if (ans === null) throw new Error("cancelled");
+    answers[q.question] = ans;
+  }
+  return { answers };
+}
+
+// One question dialog: options with descriptions, a "Type something." free
+// text entry (ZCode provides no Other option itself), and multiSelect via
+// Space toggles + Enter confirm. Esc returns null (cancels the interaction).
+async function askOneQuestionInPi(
+  ctx: ExtensionContext,
+  q: ZcodeWireQuestion,
+): Promise<string | string[] | null> {
+  const opts: { label: string; description?: string }[] = (q.options ?? []).map((o) => ({
+    label: o.label,
+    description: o.description,
+  }));
+  const multi = q.multiSelect === true;
+  const title = q.header && q.header.trim() ? `[${q.header.trim()}] ${q.question}` : q.question;
+
+  return ctx.ui.custom<string | string[] | null>(
+    (tui, theme, _kb, done) => {
+      let index = 0;
+      let editMode = false;
+      let toggled = new Set<number>();
+      let cachedLines: string[] | undefined;
+
+      const editorTheme: EditorTheme = {
+        borderColor: (s) => theme.fg("accent", s),
+        selectList: {
+          selectedPrefix: (t) => theme.fg("accent", t),
+          selectedText: (t) => theme.fg("accent", t),
+          description: (t) => theme.fg("muted", t),
+          scrollInfo: (t) => theme.fg("dim", t),
+          noMatch: (t) => theme.fg("warning", t),
+        },
+      };
+      const editor = new Editor(tui, editorTheme);
+      editor.onSubmit = (value) => {
+        const trimmed = value.trim();
+        if (trimmed) {
+          done(multi ? [trimmed] : trimmed);
+        } else {
+          editMode = false;
+          editor.setText("");
+          refresh();
+        }
+      };
+
+      function refresh() {
+        cachedLines = undefined;
+        tui.requestRender();
+      }
+
+      function handleInput(data: string) {
+        if (editMode) {
+          if (matchesKey(data, Key.escape)) {
+            editMode = false;
+            editor.setText("");
+            refresh();
+            return;
+          }
+          editor.handleInput(data);
+          refresh();
+          return;
+        }
+        if (matchesKey(data, Key.up)) {
+          index = Math.max(0, index - 1);
+          refresh();
+          return;
+        }
+        if (matchesKey(data, Key.down)) {
+          index = Math.min(opts.length, index + 1); // +1 for "Type something."
+          refresh();
+          return;
+        }
+        if (multi && matchesKey(data, Key.space) && index < opts.length) {
+          if (toggled.has(index)) toggled.delete(index);
+          else toggled.add(index);
+          refresh();
+          return;
+        }
+        if (matchesKey(data, Key.enter)) {
+          if (index === opts.length) {
+            editMode = true; // free text
+            refresh();
+            return;
+          }
+          if (multi) {
+            if (toggled.size === 0) {
+              refresh(); // require at least one selection
+              return;
+            }
+            done([...toggled].map((i) => opts[i].label));
+            return;
+          }
+          done(opts[index].label);
+          return;
+        }
+        if (matchesKey(data, Key.escape)) {
+          done(null);
+        }
+      }
+
+      function render(width: number): string[] {
+        if (cachedLines) return cachedLines;
+        const lines: string[] = [];
+        const renderWidth = Math.max(1, width);
+
+        function addWrapped(text: string) {
+          lines.push(...wrapTextWithAnsi(text, renderWidth));
+        }
+        function addWrappedWithPrefix(prefix: string, text: string) {
+          const prefixWidth = visibleWidth(prefix);
+          if (prefixWidth >= renderWidth) {
+            addWrapped(prefix + text);
+            return;
+          }
+          const wrapped = wrapTextWithAnsi(text, renderWidth - prefixWidth);
+          const continuationPrefix = " ".repeat(prefixWidth);
+          for (let i = 0; i < wrapped.length; i++) {
+            lines.push(`${i === 0 ? prefix : continuationPrefix}${wrapped[i]}`);
+          }
+        }
+
+        lines.push(theme.fg("accent", "─".repeat(renderWidth)));
+        addWrappedWithPrefix(" ", theme.fg("text", title));
+        lines.push("");
+
+        for (let i = 0; i <= opts.length; i++) {
+          const isOther = i === opts.length;
+          const selected = i === index;
+          const isToggled = !isOther && multi && toggled.has(i);
+          const prefix = selected ? theme.fg("accent", "> ") : "  ";
+          const mark = isToggled ? theme.fg("success", "✓ ") : multi && !isOther ? "  " : "";
+          const label = isOther ? "Type something." : opts[i].label;
+          const color = selected || (isOther && editMode) ? "accent" : isToggled ? "success" : "text";
+          addWrappedWithPrefix(prefix, mark + theme.fg(color, label));
+          if (!isOther && opts[i].description) {
+            addWrappedWithPrefix("     ", theme.fg("muted", opts[i].description ?? ""));
+          }
+        }
+
+        if (editMode) {
+          lines.push("");
+          addWrappedWithPrefix(" ", theme.fg("muted", "Your answer:"));
+          for (const line of editor.render(Math.max(1, renderWidth - 2))) {
+            lines.push(` ${line}`);
+          }
+        }
+
+        lines.push("");
+        if (editMode) {
+          addWrappedWithPrefix(" ", theme.fg("dim", "Enter to submit • Esc to go back"));
+        } else if (multi) {
+          addWrappedWithPrefix(
+            " ",
+            theme.fg("dim", "↑↓ navigate • Space toggle • Enter confirm • Esc cancel"),
+          );
+        } else {
+          addWrappedWithPrefix(" ", theme.fg("dim", "↑↓ navigate • Enter select • Esc cancel"));
+        }
+        lines.push(theme.fg("accent", "─".repeat(renderWidth)));
+
+        cachedLines = lines;
+        return lines;
+      }
+
+      return {
+        render,
+        invalidate: () => {
+          cachedLines = undefined;
+        },
+        handleInput,
+      };
+    },
+  );
 }
 
 // The app-server does not emit the final text until prompt_completed, but
@@ -739,6 +1020,9 @@ function streamSimple(
     out.push({ type: "start", partial: output });
     const finish = (reason: "stop" | "error" | "aborted", errorMessage?: string) => {
       if (output.stopReason !== "pending") return;
+      // Close any bash blocks still awaiting their result so every text block
+      // ends (pi finalizes messages on text_end).
+      flushPendingBashBlocks();
       if (reason === "stop") {
         output.stopReason = "stop";
         out.push({ type: "done", reason: "stop", message: output });
@@ -755,6 +1039,8 @@ function streamSimple(
     // keyed by assistantMessageId (text/reasoning). ZCode runs its own tools,
     // so tool calls/results are rendered inline as text blocks (keyed by
     // toolCallId) instead of toolCall blocks — pi would otherwise execute them.
+    // bash merges call + result into ONE fenced block (see openBashToolBlock);
+    // other tools keep separate call/result text blocks.
     const msgBlocks = new Map<string, { text?: number; thinking?: number }>();
     const toolTextBlocks = new Map<string, number>();
     const toolNames = new Map<string, string>();
@@ -762,6 +1048,7 @@ function streamSimple(
     const started = new Set<number>();
     const ended = new Set<number>();
     const partialJson = new Map<string, string>();
+    const pendingBashBlocks = new Map<string, number>();
     let streamedText = false;
     let finalResponse: string | undefined;
     let settled = false;
@@ -833,6 +1120,30 @@ function streamSimple(
       emitEnd(idx, "text");
     };
 
+    // bash: the call block stays OPEN after the `$ cmd` fence opener, so the
+    // result (arriving later as tool.updated) appends into the same block.
+    const openBashToolBlock = (callId: string, markdown: string) => {
+      const idx = toolTextFor(callId);
+      pendingBashBlocks.set(callId, idx);
+      emitDelta(idx, markdown, "text");
+    };
+    const closeBashToolBlock = (callId: string, markdown: string) => {
+      const idx = pendingBashBlocks.get(callId);
+      if (idx === undefined) return;
+      pendingBashBlocks.delete(callId);
+      emitDelta(idx, markdown, "text");
+      emitEnd(idx, "text");
+    };
+    // Close any bash block whose result never arrived (abort/error/timeout).
+    // Function declaration so `finish` (defined above) can call it safely.
+    function flushPendingBashBlocks() {
+      for (const [callId, idx] of [...pendingBashBlocks]) {
+        pendingBashBlocks.delete(callId);
+        emitDelta(idx, "\n```\n", "text");
+        emitEnd(idx, "text");
+      }
+    }
+
     // Live process: model.streaming carries the assistant text, reasoning and
     // tool-call streams in real time; turn.completed delivers the final
     // response as a fallback. state.updated (prompt_completed/prompt_failed)
@@ -867,7 +1178,11 @@ function streamSimple(
         // Tool execution status/result notifications; render results inline.
         const callId = pl.toolCallId ?? "";
         if (callId && pl.kind === "result" && pl.result !== undefined) {
-          emitToolText(`result:${callId}`, formatToolResult(pl.result));
+          if (toolNames.get(callId) === "bash" && pendingBashBlocks.has(callId)) {
+            closeBashToolBlock(callId, formatBashResultClose(pl.result));
+          } else {
+            emitToolText(`result:${callId}`, formatToolResult(pl.result));
+          }
         }
         return;
       }
@@ -908,10 +1223,13 @@ function streamSimple(
             kind === "tool_call" && pl.input !== undefined
               ? normalizeToolInput(pl.input)
               : parsePartialJson(partialJson.get(callId) ?? "");
-          emitToolText(
-            `call:${callId}`,
-            formatToolCall(toolNames.get(callId) ?? pl.toolName ?? "tool", args),
-          );
+          const toolName = toolNames.get(callId) ?? pl.toolName ?? "tool";
+          if (toolName === "bash") {
+            // Open the merged command+result fence; the result closes it.
+            openBashToolBlock(callId, formatBashCallOpen(args));
+          } else {
+            emitToolText(`call:${callId}`, formatToolCall(toolName, args));
+          }
         }
       }
     };
@@ -1073,6 +1391,11 @@ function toPiModels(catalog: CatalogModel[]) {
 
 export default function (pi: ExtensionAPI) {
   mergeV2Providers();
+  // Capture the pi UI context so interaction/requestUserInput (askUserQuestion)
+  // can show its dialog from the app-server's request handler.
+  pi.on("session_start", (_event, ctx) => {
+    uiCtx = ctx;
+  });
   pi.registerProvider("zcode", {
     name: "ZCode (app-server)",
     baseUrl: "zcode://app-server",

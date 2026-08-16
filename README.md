@@ -124,6 +124,25 @@ Messages typed in pi while the ZCode agent is mid-task are delivered using
   duplicated into the next turn. The steered run's reply streams into pi as
   usual.
 
+## Asking you questions (ZCode's `askUserQuestion`)
+
+When the ZCode agent calls its `askUserQuestion` tool, the app-server asks the
+bridge for user input (`interaction/requestUserInput`). The bridge shows the
+question as a pi dialog — options with descriptions, `Space` toggles for
+multi-select, plus a free-text "Type something." entry — and answers the
+request with your choice. The ZCode agent then continues **in the same
+session** with your answer (the tool returns "User has answered your
+questions: ...").
+
+- The dialog appears mid-turn; the stream stays open until you answer or press
+  `Esc` to cancel (cancelling answers the request with `cancel`).
+- Up to 4 questions per interaction are asked one after another.
+- The server auto-resolves unanswered interactions after 5 minutes
+  (`askUserQuestionAutoResolutionEnabled`), so a dialog left open will not hang
+  the turn forever.
+- The tool call is still rendered in the transcript
+  (`🔧 askUserQuestion` with the question text) followed by the answer.
+
 ## Known limitations
 
 - A turn that exceeds `ZCODE_TURN_TIMEOUT_MS` (default 30 min) is
@@ -136,10 +155,13 @@ Messages typed in pi while the ZCode agent is mid-task are delivered using
   and the final text is also reconciled from the messages store when no live
   deltas were seen (e.g. subscription failed).
 - Tool calls are **display-only**: ZCode runs them inside its own session, and
-  the bridge renders each call + result as an inline markdown block in stream
-  order, so reasoning, tools and the final answer interleave in the transcript.
-  pi never receives `toolCall` blocks — the pi harness would otherwise try to
-  execute ZCode's tools itself and re-prompt the model.
+  the bridge renders each call + result as inline markdown in stream order, so
+  reasoning, tools and the final answer interleave in the transcript. bash
+  calls merge command + output into a single ```` ```text ```` block (first line
+  `$ cmd`), echoing pi's native bash rendering; other tools render as a
+  `🔧 name` header line plus a result block. pi never receives `toolCall`
+  blocks — the pi harness would otherwise try to execute ZCode's tools itself
+  and re-prompt the model.
 - pi's RPC/print mode has a model-resolver crash in some pi 0.84.2 builds that
   also affects built-in providers; interactive `/model` is unaffected.
 - The resident-pool eviction cannot be configured from outside the app-server;
