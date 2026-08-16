@@ -589,7 +589,8 @@ interface ZcodeMessage {
 //   tool.updated:   {toolCallId, toolName, kind: scheduled|started|result|
 //       batch, result?: {success, content, truncated}}  (tool execution status
 //       and output; the bridge renders these inline in the transcript)
-//   turn.completed: {response}   turn.failed: {reason}
+//   turn.completed: {response}   turn.failed: {error}  (structured: type,
+//       message, code?, detail?, attribution?.statusCode)
 //   session.updated: {taskId, taskKind, status, toolName, command, pid, ...}
 //       (background-task status pushes, e.g. run_in_background bash)
 interface ZcodeStreamEvent {
@@ -604,9 +605,28 @@ interface ZcodeStreamEvent {
     reason?: string;
     response?: string;
     result?: ZcodeToolResult;
+    error?: ZcodeTurnError;
     taskId?: string;
     taskKind?: string;
     status?: string;
+  };
+}
+
+// Structured turn error from turn.failed (and the session state patch's
+// lastError): the upstream model/API failure that ended the turn.
+interface ZcodeTurnError {
+  type?: string;
+  message?: string;
+  code?: string;
+  detail?: string;
+  retryable?: boolean;
+  attribution?: {
+    statusCode?: number;
+    transport?: string;
+    source?: string;
+    providerId?: string;
+    modelId?: string;
+    reason?: string;
   };
 }
 
@@ -793,6 +813,17 @@ function truncateTail(
 
 function formatDuration(ms: number): string {
   return `${(ms / 1000).toFixed(1)}s`;
+}
+
+// One-line display of a ZCode turn error (upstream API timeouts, auth
+// failures, ...) so pi shows the real reason instead of a generic "turn
+// ended with failure". "Origin Time-out" + statusCode 524 from the
+// app-server's attribution becomes "Origin Time-out (HTTP 524)".
+function formatTurnError(e: ZcodeTurnError): string {
+  const s = e.message?.trim() || "unknown error";
+  if (e.attribution?.statusCode) return `${s} (HTTP ${e.attribution.statusCode})`;
+  if (e.code) return `${s} (${e.code})`;
+  return s;
 }
 
 function formatToolResult(name: string, result: ZcodeToolResult): string {
@@ -1253,6 +1284,7 @@ function streamSimple(
     const partialJson = new Map<string, string>();
     let streamedText = false;
     let finalResponse: string | undefined;
+    let turnError: string | undefined;
     let settled = false;
     let turnSettled = false;
     let failed = false;
@@ -1354,9 +1386,21 @@ function streamSimple(
       const m = msg as { method?: string; params?: unknown };
       if (!m.method || !m.params) return;
       if (m.method === "state.updated") {
-        const reason = (m.params as { reason?: string }).reason;
+        const params = m.params as {
+          reason?: string;
+          patch?: { status?: string; lastError?: ZcodeTurnError };
+        };
+        const reason = params.reason;
         if (reason === "prompt_completed") settled = true;
         if (reason === "prompt_failed") failed = true;
+        // Defensive fallback (unsubscribed/background turns): the session
+        // state patch carries status "error" + lastError when a turn fails.
+        if (params.patch?.status === "error") {
+          failed = true;
+          if (!turnError && params.patch.lastError?.message) {
+            turnError = formatTurnError(params.patch.lastError);
+          }
+        }
         if (reason === "prompt_completed" || reason === "prompt_failed") turnSettled = true;
         return;
       }
@@ -1373,6 +1417,9 @@ function streamSimple(
       if (ev.type === "turn.failed") {
         failed = true;
         turnSettled = true;
+        // turn.failed carries the structured error (type/message/code/detail
+        // + attribution.statusCode); surface the real reason to pi.
+        if (!turnError && pl.error?.message) turnError = formatTurnError(pl.error);
         return;
       }
       if (ev.type === "tool.updated") {
@@ -1612,7 +1659,7 @@ function streamSimple(
     turnActive = false;
 
     if (failed) {
-      finish("error", "zcode turn ended with failure");
+      finish("error", turnError ? `zcode turn failed: ${turnError}` : "zcode turn ended with failure");
       return;
     }
     if (!streamedText) {

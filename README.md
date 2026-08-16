@@ -170,6 +170,13 @@ questions: ...").
   (`run_in_background` bash etc.) the agent started in the session — ZCode's
   own stop leaves those running, so the bridge stops them explicitly
   (`session/cancelBackgroundTask` per running task).
+- **Upstream model/API failures are surfaced with the real reason.** When the
+  ZCode turn fails (model API timeout, auth error, ...), the app-server's
+  `turn.failed` event carries the structured error; the bridge forwards its
+  message (plus the HTTP status code when the app-server reports one, e.g.
+  `zcode turn failed: Origin Time-out (HTTP 524)`) to pi instead of a generic
+  "turn ended with failure". Cancelling a turn (`session/stop`) is reported as
+  a cancellation, never as a failure.
 - The app-server streams reasoning, tool calls and text live (`model.streaming`
   and `tool.updated` events after `session/subscribe`); deltas arrive chunked,
   and the final text is also reconciled from the messages store when no live
