@@ -21,7 +21,24 @@ test("headless config watchers are unreferenced", () => {
   assert.match(source, /watcher\.unref\(\)/);
 });
 
-test("ZCode model limits are exposed to Pi", () => {
-  assert.match(source, /contextWindow: m\.contextWindow \?\? 200000/);
-  assert.match(source, /maxTokens: m\.maxTokens \?\? 8192/);
+test("ZCode model limits are exposed to Pi and refreshed from runtime", () => {
+  assert.match(source, /runtime\?\.contextWindow \?\? m\.contextWindow \?\? 200000/);
+  assert.match(source, /runtime\?\.maxTokens \?\? m\.maxTokens \?\? 8192/);
+  assert.match(source, /applyRuntimeModelMetadata\(snapshot, ref, model\)/);
+});
+
+test("Pi compaction is mirrored to the ZCode session", () => {
+  assert.match(source, /pi\.on\("session_compact"/);
+  assert.match(source, /"session\/compact"/);
+  assert.match(source, /reason === "session_compacted"/);
+});
+
+test("context usage comes from the final app-server snapshot", () => {
+  assert.match(source, /applyContextSnapshotUsage\(output, snapshot\.runtime\?\.contextUsage\)/);
+});
+
+test("only exact ZCode reasoning variants are exposed to Pi", () => {
+  assert.match(source, /xhigh: available\.has\("xhigh"\) \? "xhigh" : null/);
+  assert.match(source, /medium: available\.has\("medium"\) \? "medium" : null/);
+  assert.match(source, /"session\/setThoughtLevel"/);
 });

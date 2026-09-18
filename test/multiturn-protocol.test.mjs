@@ -104,11 +104,11 @@ test("ignores racy prompt_completed snapshots across consecutive turns", async (
       assert.deepEqual(answer, [`FIXTURE-TURN-${turn}-OK`]);
     }
     assert.deepEqual(state.usages.at(-1), {
-      input: 60,
+      input: 50,
       output: 7,
-      cacheRead: 40,
+      cacheRead: 30,
       cacheWrite: 0,
-      totalTokens: 107,
+      totalTokens: 87,
       cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
     });
     const merged = JSON.parse(await readFile(settings, "utf8"));

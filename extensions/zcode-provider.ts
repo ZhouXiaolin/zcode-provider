@@ -58,6 +58,7 @@ import type {
   Context,
   Model,
   SimpleStreamOptions,
+  ThinkingLevelMap,
 } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { InputEventResult } from "@earendil-works/pi-coding-agent";
@@ -154,6 +155,32 @@ interface CatalogModel {
   modelId: string;
   contextWindow?: number; // settings file models[id].limit.context
   maxTokens?: number; // settings file models[id].limit.output
+  reasoningVariants?: string[];
+}
+
+interface RuntimeModelMetadata {
+  contextWindow?: number;
+  maxTokens?: number;
+  reasoningVariants?: string[];
+}
+
+// The CLI config can advertise different metadata from the model materialized
+// by the app-server. Once a session exposes the authoritative registry entry,
+// retain it for /model refreshes and subsequent turns.
+const runtimeModelMetadata = new Map<string, RuntimeModelMetadata>();
+
+function thinkingLevelMapOf(variants: string[] | undefined): ThinkingLevelMap | undefined {
+  if (!variants?.length) return undefined;
+  const available = new Set(variants);
+  return {
+    off: available.has("off") ? "off" : available.has("disabled") ? "disabled" : null,
+    minimal: available.has("minimal") ? "minimal" : null,
+    low: available.has("low") ? "low" : null,
+    medium: available.has("medium") ? "medium" : null,
+    high: available.has("high") ? "high" : null,
+    xhigh: available.has("xhigh") ? "xhigh" : null,
+    max: available.has("max") ? "max" : null,
+  };
 }
 
 // The app-server resolves models only from its settings file provider map; the
@@ -164,7 +191,10 @@ function readCatalog(): CatalogModel[] {
     const cfg = JSON.parse(readFileSync(SETTINGS_PATH, "utf8")) as {
       provider?: Record<string, {
         name?: string;
-        models?: Record<string, { limit?: { context?: number; output?: number } }>;
+        models?: Record<string, {
+          limit?: { context?: number; output?: number };
+          reasoning?: { variants?: string[] };
+        }>;
       }>;
     };
     const models = Object.entries(cfg.provider ?? {}).flatMap(([providerId, p]) =>
@@ -174,6 +204,7 @@ function readCatalog(): CatalogModel[] {
         modelId,
         contextWindow: m.limit?.context,
         maxTokens: m.limit?.output,
+        reasoningVariants: m.reasoning?.variants,
       })),
     );
     // A previous bridge version may have left a non-reserved alias beside the
@@ -618,6 +649,7 @@ let proc: ChildProcess | null = null;
 const listeners = new Set<(msg: unknown) => void>();
 let sessionId: string | null = null;
 let lastModelId: string | null = null;
+let lastThoughtLevel: string | null = null;
 let probeLog: ((line: string) => void) | null = null;
 
 // ---- ZCode session continuity across pi restarts ----
@@ -783,6 +815,8 @@ function startServer(): void {
     if (proc !== child) return;
     proc = null;
     sessionId = null;
+    lastModelId = null;
+    lastThoughtLevel = null;
     guideSessions.clear();
     for (const [, p] of pending) p.reject(err);
     pending.clear();
@@ -801,6 +835,54 @@ function request<T = unknown>(method: string, params?: unknown): Promise<T> {
     pending.set(String(id), { resolve: resolve as (v: unknown) => void, reject });
     proc!.stdin!.write(JSON.stringify({ id, method, params }) + "\n");
   });
+}
+
+async function compactZcodeSession(sid: string): Promise<void> {
+  let done = false;
+  let resolveCompletion!: () => void;
+  let rejectCompletion!: (error: Error) => void;
+  const completion = new Promise<void>((resolve, reject) => {
+    resolveCompletion = resolve;
+    rejectCompletion = reject;
+  });
+  const onEvent = (message: unknown) => {
+    if (typeof message !== "object" || message === null) return;
+    const msg = message as {
+      method?: string;
+      params?: { sessionId?: string; reason?: string };
+    };
+    if (msg.method !== "state.updated" || msg.params?.sessionId !== sid) return;
+    if (msg.params.reason === "session_compacted") {
+      done = true;
+      resolveCompletion();
+    } else if (
+      msg.params.reason === "session_compact_failed" ||
+      msg.params.reason === "session_compact_cancelled"
+    ) {
+      done = true;
+      rejectCompletion(new Error(`ZCode ${msg.params.reason}`));
+    }
+  };
+  listeners.add(onEvent);
+  const timeout = setTimeout(() => {
+    if (!done) rejectCompletion(new Error("ZCode compaction timed out"));
+  }, 3 * 60 * 1000);
+  try {
+    const result = await request<{
+      compact?: { state?: "accepted" | "already_running" };
+    }>("session/compact", {
+      sessionId: sid,
+      instructions:
+        "Preserve the active task, user requirements, decisions, modified files, command results, pending work, and background task state.",
+    });
+    if (result.compact?.state !== "accepted" && result.compact?.state !== "already_running") {
+      throw new Error("ZCode app-server did not accept compaction");
+    }
+    await completion;
+  } finally {
+    clearTimeout(timeout);
+    listeners.delete(onEvent);
+  }
 }
 
 interface ZcodeMessagePart {
@@ -833,6 +915,31 @@ interface ZcodeUsage {
   cacheWriteTokens?: number;
 }
 
+interface ZcodeContextUsage {
+  used?: number;
+  size?: number;
+  cache?: {
+    // ZCode counts cached input inside inputTokens.
+    inputTokens?: number;
+    cacheReadTokens?: number;
+    cacheWriteTokens?: number;
+  };
+}
+
+interface ZcodeSessionSnapshot {
+  runtime?: { contextUsage?: ZcodeContextUsage };
+  settings?: {
+    model?: {
+      available?: Array<{
+        ref?: { providerId?: string; modelId?: string };
+        contextWindow?: number;
+        maxOutputTokens?: number;
+        reasoning?: { levels?: Array<{ value?: string }> };
+      }>;
+    };
+  };
+}
+
 interface ZcodeStreamEvent {
   type: string;
   payload?: {
@@ -851,6 +958,48 @@ interface ZcodeStreamEvent {
     taskKind?: string;
     status?: string;
   };
+}
+
+function applyRuntimeModelMetadata(
+  snapshot: ZcodeSessionSnapshot,
+  ref: { providerId: string; modelId: string },
+  model: Model<Api>,
+): void {
+  const available = snapshot.settings?.model?.available?.find(
+    (candidate) =>
+      candidate.ref?.providerId === ref.providerId && candidate.ref?.modelId === ref.modelId,
+  );
+  if (!available) return;
+  const contextWindow = available.contextWindow;
+  const maxTokens = available.maxOutputTokens;
+  const reasoningVariants = available.reasoning?.levels
+    ?.map((level) => level.value)
+    .filter((value): value is string => typeof value === "string");
+  if (typeof contextWindow === "number" && contextWindow > 0) {
+    model.contextWindow = contextWindow;
+  }
+  if (typeof maxTokens === "number" && maxTokens > 0) model.maxTokens = maxTokens;
+  if (reasoningVariants?.length) {
+    model.reasoning = true;
+    model.thinkingLevelMap = thinkingLevelMapOf(reasoningVariants);
+  }
+  runtimeModelMetadata.set(model.id, { contextWindow, maxTokens, reasoningVariants });
+}
+
+function applyContextSnapshotUsage(output: AssistantMessage, usage?: ZcodeContextUsage): void {
+  const used = usage?.used;
+  if (typeof used !== "number" || used < 0) return;
+  const rawInput = Math.min(used, Math.max(0, usage?.cache?.inputTokens ?? used));
+  const cacheRead = Math.min(rawInput, Math.max(0, usage?.cache?.cacheReadTokens ?? 0));
+  const cacheWrite = Math.min(
+    rawInput - cacheRead,
+    Math.max(0, usage?.cache?.cacheWriteTokens ?? 0),
+  );
+  output.usage.input = Math.max(0, rawInput - cacheRead - cacheWrite);
+  output.usage.output = Math.max(0, used - rawInput);
+  output.usage.cacheRead = cacheRead;
+  output.usage.cacheWrite = cacheWrite;
+  output.usage.totalTokens = used;
 }
 
 // Structured turn error from turn.failed (and the session state patch's
@@ -1790,6 +1939,7 @@ function streamSimple(
             await request("session/resume", { sessionId: remembered });
             sessionId = remembered;
             lastModelId = null;
+            lastThoughtLevel = null;
           } catch {
             // Session no longer exists server-side (store cleared/purged):
             // fall through to a fresh create.
@@ -1802,6 +1952,7 @@ function streamSimple(
           });
           sessionId = created.session.sessionId;
           lastModelId = null;
+          lastThoughtLevel = null;
           rememberSession(sessionId, process.cwd());
         }
       } else {
@@ -1813,10 +1964,36 @@ function streamSimple(
         // gaps without ever surfacing that error.
         await request("session/resume", { sessionId });
       }
+      const requestedThinking = options?.reasoning;
+      const mappedThinking = requestedThinking
+        ? model.thinkingLevelMap?.[requestedThinking]
+        : undefined;
+      const reasoningLevel =
+        typeof mappedThinking === "string"
+          ? mappedThinking
+          : model.reasoning
+            ? undefined
+            : reasoningLevelOf(sourceRef.providerId, sourceRef.modelId);
+      if (MODERN_PROTOCOL && model.reasoning && !reasoningLevel) {
+        const supported = Object.entries(model.thinkingLevelMap ?? {})
+          .filter(([, value]) => typeof value === "string")
+          .map(([level]) => level)
+          .join(", ");
+        throw new Error(
+          `select a supported thinking level for ${model.id}: ${supported || "none"}`,
+        );
+      }
       if (lastModelId !== model.id) {
-        const reasoningLevel = reasoningLevelOf(sourceRef.providerId, sourceRef.modelId);
         if (process.env.ZCODE_DEBUG) {
-          console.error("[zcode-debug] model selection", { sourceRef, ref, reasoningLevel });
+          console.error("[zcode-debug] model selection", {
+            sourceRef,
+            ref,
+            requestedThinking,
+            mappedThinking,
+            reasoning: model.reasoning,
+            thinkingLevelMap: model.thinkingLevelMap,
+            reasoningLevel,
+          });
         }
         await request("session/setModel", {
           sessionId,
@@ -1826,6 +2003,17 @@ function streamSimple(
               : ref,
         });
         lastModelId = model.id;
+        lastThoughtLevel = MODERN_PROTOCOL ? reasoningLevel ?? null : null;
+      } else if (
+        MODERN_PROTOCOL &&
+        reasoningLevel &&
+        reasoningLevel !== lastThoughtLevel
+      ) {
+        await request("session/setThoughtLevel", {
+          sessionId,
+          thoughtLevel: reasoningLevel,
+        });
+        lastThoughtLevel = reasoningLevel;
       }
       const last = [...context.messages].reverse().find((m) => m.role === "user");
       prompt =
@@ -1950,6 +2138,27 @@ function streamSimple(
       finish("error", turnError ? `zcode turn failed: ${turnError}` : "zcode turn ended with failure");
       return;
     }
+    try {
+      // turn.completed.usage is cumulative across every hidden model request
+      // in ZCode's internal tool loop, so it can legitimately exceed the
+      // model context window. Pi needs the final request's live context usage
+      // for its context bar and automatic compaction threshold instead.
+      const snapshot = await request<ZcodeSessionSnapshot>("session/read", {
+        sessionId,
+        messageLimit: 1,
+      });
+      applyRuntimeModelMetadata(snapshot, ref, model);
+      applyContextSnapshotUsage(output, snapshot.runtime?.contextUsage);
+    } catch (error) {
+      // Older app-servers may not expose runtime.contextUsage. Keep the
+      // aggregate turn.completed usage as a compatibility fallback.
+      if (process.env.ZCODE_DEBUG) {
+        console.error(
+          "[zcode-debug] session/read context usage failed:",
+          error instanceof Error ? error.message : String(error),
+        );
+      }
+    }
     if (!streamedText) {
       // No live deltas arrived (unsubscribed/quiet model): fall back to the
       // definitive final response, then to the messages store.
@@ -1980,15 +2189,22 @@ const FALLBACK_MODELS = [
 
 function toPiModels(catalog: CatalogModel[]) {
   return catalog.length
-    ? catalog.map((m) => ({
-        id: m.id,
-        name: m.id,
-        reasoning: false,
-        input: ["text"],
-        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-        contextWindow: m.contextWindow ?? 200000,
-        maxTokens: m.maxTokens ?? 8192,
-      }))
+    ? catalog.map((m) => {
+        const runtime = runtimeModelMetadata.get(m.id);
+        const reasoningVariants = runtime?.reasoningVariants ?? m.reasoningVariants;
+        return {
+          id: m.id,
+          name: m.id,
+          reasoning: Boolean(reasoningVariants?.length),
+          ...(reasoningVariants?.length
+            ? { thinkingLevelMap: thinkingLevelMapOf(reasoningVariants) }
+            : {}),
+          input: ["text"],
+          cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+          contextWindow: runtime?.contextWindow ?? m.contextWindow ?? 200000,
+          maxTokens: runtime?.maxTokens ?? m.maxTokens ?? 8192,
+        };
+      })
     : FALLBACK_MODELS;
 }
 
@@ -2019,6 +2235,24 @@ export default function (pi: ExtensionAPI) {
     streamSimple,
   });
   watchConfigs();
+
+  // Pi compaction only rewrites Pi's session branch; ZCode persists an
+  // independent conversation in app-server. Compact both stores together so
+  // the next ZCode turn does not immediately refill Pi's context meter from
+  // the uncompressed server-side history.
+  pi.on("session_compact", async (_event, ctx) => {
+    const sid = sessionId;
+    if (!sid) return;
+    try {
+      await compactZcodeSession(sid);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (process.env.ZCODE_DEBUG) {
+        console.error("[zcode-debug] synchronized compaction failed:", message);
+      }
+      ctx.ui.notify(`Pi compacted, but ZCode compaction failed: ${message}`, "warning");
+    }
+  });
 
   pi.registerCommand("zcode-probe", {
     description: "Probe zcode app-server: one full turn, dump raw protocol lines",
@@ -2094,6 +2328,7 @@ export default function (pi: ExtensionAPI) {
       }
       sessionId = null;
       lastModelId = null;
+      lastThoughtLevel = null;
     }
     proc?.kill();
     proc = null;

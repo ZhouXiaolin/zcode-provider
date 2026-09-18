@@ -181,15 +181,40 @@ questions: ...").
 - The tool call is still rendered in the transcript
   (`🔧 askUserQuestion` with the question text) followed by the answer.
 
-## Token usage
+## Context and token usage
 
-The bridge forwards the aggregate usage attached to ZCode's authoritative
-`turn.completed` event into pi: uncached input, output, cache reads, cache
-writes, and total tokens. This includes all model requests made by one ZCode
-turn. ZCode does not expose pricing for these dynamically configured models,
-so monetary cost remains zero unless a future protocol version provides it.
-Older app-server builds that omit `turn.completed.payload.usage` continue to
-report zero usage.
+A ZCode turn can make many internal model requests while its agent runs tools.
+Consequently, the aggregate `turn.completed.payload.usage` can exceed the
+model's context window even though no individual request does. Using that
+aggregate as pi's `totalTokens` makes the context meter and auto-compaction
+threshold incorrect.
+
+After each completed turn, the bridge now reads the app-server's authoritative
+`runtime.contextUsage` snapshot. Pi usage reflects the final model request:
+uncached input, output, cache reads, cache writes, and the live context total.
+The app-server's materialized context-window/output limits also replace stale
+limits from the CLI config once they are available. Older app-server builds
+without the snapshot retain the aggregate `turn.completed` usage fallback.
+
+Pi and ZCode persist separate conversation histories. When pi successfully
+compacts its branch (manual, threshold, or overflow compaction), the bridge
+also calls ZCode Protocol `session/compact` and waits for the
+`session_compacted` state update. This keeps the server-side agent history in
+sync instead of letting the next turn immediately restore the pre-compaction
+context size.
+
+ZCode does not expose pricing for dynamically configured models, so monetary
+cost remains zero unless a future protocol version provides it.
+
+## Thinking levels
+
+The bridge exposes only reasoning levels that the materialized ZCode model
+actually supports. For GLM-5.3 and GLM-5.3-Flash these are `low`, `high`, and
+`max`; Pi levels such as `minimal`, `medium`, and `xhigh` are marked
+unsupported rather than silently remapped. Selecting a supported Pi thinking
+level is passed as `model.options.reasoningLevel` on model selection. Changing
+`/thinking` without changing the model calls ZCode Protocol
+`session/setThoughtLevel`, so Pi and the active ZCode session stay in sync.
 
 ## Known limitations
 
