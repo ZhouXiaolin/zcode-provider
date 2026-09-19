@@ -27,10 +27,13 @@ test("ZCode model limits are exposed to Pi and refreshed from runtime", () => {
   assert.match(source, /applyRuntimeModelMetadata\(snapshot, ref, model\)/);
 });
 
-test("Pi compaction is mirrored to the ZCode session", () => {
-  assert.match(source, /pi\.on\("session_compact"/);
-  assert.match(source, /"session\/compact"/);
-  assert.match(source, /reason === "session_compacted"/);
+test("ZCode owns compaction while Pi only reports completed auto-compactions", () => {
+  assert.match(source, /pi\.on\("session_before_compact"/);
+  assert.match(source, /ctx\.model\?\.provider !== "zcode"/);
+  assert.match(source, /return \{ cancel: true \}/);
+  assert.match(source, /pl\.trigger === "auto"/);
+  assert.match(source, /ZCode automatically compacted its context/);
+  assert.doesNotMatch(source, /request[^\n]*"session\/compact"/);
 });
 
 test("context usage comes from the final app-server snapshot", () => {

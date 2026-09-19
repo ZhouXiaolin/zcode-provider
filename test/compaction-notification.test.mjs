@@ -1,6 +1,5 @@
 import assert from "node:assert/strict";
-import { existsSync } from "node:fs";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createInterface } from "node:readline";
@@ -12,12 +11,11 @@ const root = fileURLToPath(new URL("..", import.meta.url));
 const extension = join(root, "extensions/zcode-provider.ts");
 const fixture = join(root, "fixtures/fake-zcode-server.mjs");
 
-test("mirrors successful Pi compaction to the ZCode session", async () => {
+test("reports ZCode auto-compaction without initiating compaction", async () => {
   const dir = await mkdtemp(join(tmpdir(), "pi-zcode-compact-test-"));
   const settings = join(dir, "cli.json");
   const desktop = join(dir, "v2.json");
   const bridge = join(dir, "provider.json");
-  const marker = join(dir, "compact.json");
   const provider = {
     name: "Z.ai - Coding Plan",
     kind: "anthropic",
@@ -30,7 +28,7 @@ test("mirrors successful Pi compaction to the ZCode session", async () => {
     models: {
       "GLM-5.3-Flash": {
         reasoning: { enabled: true, variants: ["low", "high", "max"], defaultVariant: "max" },
-        limit: { context: 200_000, output: 128_000 },
+        limit: { context: 1_000_000, output: 128_000 },
       },
     },
   };
@@ -60,8 +58,7 @@ test("mirrors successful Pi compaction to the ZCode session", async () => {
         ZCODE_BRIDGE_PROVIDER_CONFIG: bridge,
         ZCODE_PROTOCOL_VARIANT: "modern",
         FAKE_ZCODE_PROTOCOL_VARIANT: "modern",
-        FAKE_ZCODE_FIRST_RESPONSE_CHARS: "300000",
-        FAKE_ZCODE_COMPACT_MARKER: marker,
+        FAKE_ZCODE_AUTO_COMPACT: "1",
       },
       stdio: ["pipe", "pipe", "pipe"],
     },
@@ -82,25 +79,15 @@ test("mirrors successful Pi compaction to the ZCode session", async () => {
   });
 
   try {
-    const answer = waitFor(
-      (event) => event.type === "message_end" && event.message?.role === "assistant",
-      "first turn",
+    const notification = waitFor(
+      (event) => event.type === "extension_ui_request" && event.method === "notify",
+      "auto-compaction notification",
     );
-    child.stdin.write(`${JSON.stringify({ id: "prompt", type: "prompt", message: "produce history" })}\n`);
-    await answer;
-
-    const compacted = waitFor((event) => event.type === "compaction_end", "Pi compaction");
-    child.stdin.write(`${JSON.stringify({
-      id: "compact",
-      type: "compact",
-      customInstructions: "Keep the latest task state.",
-    })}\n`);
-    const event = await compacted;
-    assert.equal(event.errorMessage, undefined);
-    assert.equal(existsSync(marker), true, `ZCode compact was not called: ${stderr}`);
-    const params = JSON.parse(await readFile(marker, "utf8"));
-    assert.equal(params.sessionId, "fixture-session");
-    assert.match(params.instructions, /Preserve the active task/);
+    child.stdin.write(`${JSON.stringify({ id: "prompt", type: "prompt", message: "compact internally" })}\n`);
+    const event = await notification;
+    assert.equal(event.notifyType, "info");
+    assert.match(event.message, /ZCode automatically compacted its context/);
+    assert.match(event.message, /980,000 → 72,000 tokens/);
   } finally {
     child.kill("SIGTERM");
     lines.close();

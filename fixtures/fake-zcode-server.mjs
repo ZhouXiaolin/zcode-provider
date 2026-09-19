@@ -6,7 +6,6 @@
 // reason prompt_completed can arrive after turn.started but before the new
 // model output and turn.completed event. Keep this fixture version-scoped and
 // revalidate it against the real app-server when ZCode's protocol changes.
-import { writeFileSync } from "node:fs";
 import { createInterface } from "node:readline";
 
 const input = createInterface({ input: process.stdin });
@@ -88,6 +87,16 @@ input.on("line", (line) => {
     }
 
     setTimeout(() => {
+      if (process.env.FAKE_ZCODE_AUTO_COMPACT === "1") {
+        event("session.updated", {
+          operationId: "fixture-auto-compact",
+          status: "completed",
+          trigger: "auto",
+          compactReason: "context_limit",
+          preCompactTokenCount: 980_000,
+          truePostCompactTokenCount: 72_000,
+        });
+      }
       event("model.streaming", {
         kind: "text_delta",
         assistantMessageId: `assistant-${turn}`,
@@ -142,24 +151,6 @@ input.on("line", (line) => {
         },
       },
     });
-    return;
-  }
-  if (method === "session/compact") {
-    if (process.env.FAKE_ZCODE_COMPACT_MARKER) {
-      writeFileSync(process.env.FAKE_ZCODE_COMPACT_MARKER, JSON.stringify(request.params));
-    }
-    send({ id, result: { compact: { state: "accepted" } } });
-    setTimeout(() => {
-      send({
-        method: "state.updated",
-        params: {
-          scope: "session",
-          sessionId: "fixture-session",
-          reason: "session_compacted",
-          patch: { status: "idle" },
-        },
-      });
-    }, 10);
     return;
   }
   if (method === "session/messages") {

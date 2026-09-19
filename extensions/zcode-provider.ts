@@ -727,6 +727,9 @@ let turnActive = false;
 // (v4 stop / session/stop) leaves them running; the bridge cancels them when a
 // pi turn is aborted so a cancel in pi stops everything the agent started.
 const runningTasksBySession = new Map<string, Set<string>>();
+// A continuous subscription may replay durable lifecycle events. Remember
+// completed compactions so each one produces at most one Pi notification.
+const notifiedCompactionOperations = new Set<string>();
 // ZCode tool names are namespaced: builtins are plain ("Bash", "Read"),
 // MCP tools are "mcp__<server>__<tool>" (e.g. "mcp__codegraph__codegraph_explore"),
 // skills/plugins may use their own prefixes. Tool calls are rendered inline in
@@ -837,54 +840,6 @@ function request<T = unknown>(method: string, params?: unknown): Promise<T> {
   });
 }
 
-async function compactZcodeSession(sid: string): Promise<void> {
-  let done = false;
-  let resolveCompletion!: () => void;
-  let rejectCompletion!: (error: Error) => void;
-  const completion = new Promise<void>((resolve, reject) => {
-    resolveCompletion = resolve;
-    rejectCompletion = reject;
-  });
-  const onEvent = (message: unknown) => {
-    if (typeof message !== "object" || message === null) return;
-    const msg = message as {
-      method?: string;
-      params?: { sessionId?: string; reason?: string };
-    };
-    if (msg.method !== "state.updated" || msg.params?.sessionId !== sid) return;
-    if (msg.params.reason === "session_compacted") {
-      done = true;
-      resolveCompletion();
-    } else if (
-      msg.params.reason === "session_compact_failed" ||
-      msg.params.reason === "session_compact_cancelled"
-    ) {
-      done = true;
-      rejectCompletion(new Error(`ZCode ${msg.params.reason}`));
-    }
-  };
-  listeners.add(onEvent);
-  const timeout = setTimeout(() => {
-    if (!done) rejectCompletion(new Error("ZCode compaction timed out"));
-  }, 3 * 60 * 1000);
-  try {
-    const result = await request<{
-      compact?: { state?: "accepted" | "already_running" };
-    }>("session/compact", {
-      sessionId: sid,
-      instructions:
-        "Preserve the active task, user requirements, decisions, modified files, command results, pending work, and background task state.",
-    });
-    if (result.compact?.state !== "accepted" && result.compact?.state !== "already_running") {
-      throw new Error("ZCode app-server did not accept compaction");
-    }
-    await completion;
-  } finally {
-    clearTimeout(timeout);
-    listeners.delete(onEvent);
-  }
-}
-
 interface ZcodeMessagePart {
   type: string;
   text?: string;
@@ -957,6 +912,10 @@ interface ZcodeStreamEvent {
     taskId?: string;
     taskKind?: string;
     status?: string;
+    operationId?: string;
+    trigger?: string;
+    preCompactTokenCount?: number;
+    truePostCompactTokenCount?: number;
   };
 }
 
@@ -1855,6 +1814,25 @@ function streamSimple(
         return;
       }
       if (ev.type === "session.updated") {
+        // ZCode's internal auto-compaction is exposed as a durable compact
+        // lifecycle event mapped by app-server to session.updated. Report it
+        // in Pi, but never initiate, stop, or otherwise synchronize it.
+        if (
+          pl.trigger === "auto" &&
+          pl.status === "completed" &&
+          pl.operationId &&
+          !notifiedCompactionOperations.has(pl.operationId)
+        ) {
+          notifiedCompactionOperations.add(pl.operationId);
+          const before = pl.preCompactTokenCount;
+          const after = pl.truePostCompactTokenCount;
+          const counts =
+            typeof before === "number" && typeof after === "number"
+              ? ` (${before.toLocaleString()} → ${after.toLocaleString()} tokens)`
+              : "";
+          uiCtx?.ui.notify(`ZCode automatically compacted its context${counts}.`, "info");
+        }
+
         // Background-task status pushes (run_in_background bash etc.): track
         // running tasks so a pi abort can stop them too (ZCode's own stop
         // does not). Any non-"running" status retires the task id.
@@ -2236,22 +2214,13 @@ export default function (pi: ExtensionAPI) {
   });
   watchConfigs();
 
-  // Pi compaction only rewrites Pi's session branch; ZCode persists an
-  // independent conversation in app-server. Compact both stores together so
-  // the next ZCode turn does not immediately refill Pi's context meter from
-  // the uncompressed server-side history.
-  pi.on("session_compact", async (_event, ctx) => {
-    const sid = sessionId;
-    if (!sid) return;
-    try {
-      await compactZcodeSession(sid);
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      if (process.env.ZCODE_DEBUG) {
-        console.error("[zcode-debug] synchronized compaction failed:", message);
-      }
-      ctx.ui.notify(`Pi compacted, but ZCode compaction failed: ${message}`, "warning");
-    }
+  // ZCode owns its conversation history and compacts it independently. Pi's
+  // transcript is only a UI mirror and is never sent back as ZCode context.
+  // Cancel every Pi compaction path while ZCode is active; the live protocol
+  // listener above only reports ZCode's own completed auto-compactions.
+  pi.on("session_before_compact", (_event, ctx) => {
+    if (ctx.model?.provider !== "zcode") return;
+    return { cancel: true };
   });
 
   pi.registerCommand("zcode-probe", {
@@ -2316,6 +2285,7 @@ export default function (pi: ExtensionAPI) {
     guideSessions.clear();
     v4StateBySession.clear();
     runningTasksBySession.clear();
+    notifiedCompactionOperations.clear();
     if (sessionId) {
       try {
         // Close persists the session in the app-server's store; the sidecar

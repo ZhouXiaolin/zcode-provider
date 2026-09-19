@@ -196,12 +196,21 @@ The app-server's materialized context-window/output limits also replace stale
 limits from the CLI config once they are available. Older app-server builds
 without the snapshot retain the aggregate `turn.completed` usage fallback.
 
-Pi and ZCode persist separate conversation histories. When pi successfully
-compacts its branch (manual, threshold, or overflow compaction), the bridge
-also calls ZCode Protocol `session/compact` and waits for the
-`session_compacted` state update. This keeps the server-side agent history in
-sync instead of letting the next turn immediately restore the pre-compaction
-context size.
+Pi and ZCode persist separate conversation histories. ZCode owns the model
+context and automatically compacts it near its own limit without interrupting
+the Pi turn. Pi's transcript is only a UI mirror and is not sent back as ZCode
+context, so the bridge cancels Pi's manual, threshold, and overflow compaction
+paths and never calls ZCode Protocol `session/compact`.
+
+The app-server publishes completed internal auto-compactions as live
+`session.updated` events. The bridge reports each event once through an
+informational Pi notification, including the before/after token counts when
+provided. It does not initiate, stop, or synchronize the compaction.
+
+Before the first completed turn, Pi may show the catalog fallback context
+window (currently 200K on affected configurations). After `session/read`
+materializes the active model, the bridge refreshes the meter from ZCode's
+runtime snapshot; GLM-5.3-Flash then correctly reports its 1M window.
 
 ZCode does not expose pricing for dynamically configured models, so monetary
 cost remains zero unless a future protocol version provides it.
