@@ -76,6 +76,8 @@ Environment variables (set before starting pi):
 | `ZCODE_AUTO_ALLOW` | `1` (enabled) | Auto-answer ZCode permission prompts. Set to `0` to deny tool permission requests |
 | `ZCODE_TURN_TIMEOUT_MS` | `1800000` (30 min) | Per-turn budget. On timeout the bridge interrupts the turn (`session/stop`) and sends the session `go on`, so long tasks keep progressing instead of failing. Raise it for turns that need to run longer uninterrupted |
 | `ZCODE_STEER_MODE` | auto | How a message typed in pi while a ZCode turn is running is handled, using ZCode's own two delivery modes: `queue` (processed as a new turn after the current one completes — pi's standard behavior) or `guide` (sent to the running session via ZCode's v4 command channel and injected at the next tool/message boundary inside the same turn, falling back to a queue when the turn is not steerable). Default follows ZCode's own UI setting (`zcodeInteractionBehavior` in `~/.zcode/v2/setting.json`): `guide` when ZCode is configured for guide-mode interaction, else `queue`. Set explicitly to override |
+| `ZCODE_PROTOCOL_VARIANT` | auto | Compatibility override: `legacy` for the Desktop 0.16.5 app-server protocol, or `modern` for ZCode Desktop 3.12+. Normally auto-detected from the macOS application layout. Custom `ZCODE_SERVE_CMD` commands default to `legacy` unless this is set. |
+| `ZCODE_BRIDGE_PROVIDER_CONFIG` | process-scoped file under `~/.zcode/cli/` | Optional fixed path for the bridge-owned provider repository used by the modern app-server. By default each pi process gets its own atomic snapshot so old and new extension processes cannot overwrite one another during upgrades. It never replaces Desktop's own provider repository. |
 
 ## Testing
 
@@ -178,6 +180,16 @@ questions: ...").
   the turn forever.
 - The tool call is still rendered in the transcript
   (`🔧 askUserQuestion` with the question text) followed by the answer.
+
+## Token usage
+
+The bridge forwards the aggregate usage attached to ZCode's authoritative
+`turn.completed` event into pi: uncached input, output, cache reads, cache
+writes, and total tokens. This includes all model requests made by one ZCode
+turn. ZCode does not expose pricing for these dynamically configured models,
+so monetary cost remains zero unless a future protocol version provides it.
+Older app-server builds that omit `turn.completed.payload.usage` continue to
+report zero usage.
 
 ## Known limitations
 

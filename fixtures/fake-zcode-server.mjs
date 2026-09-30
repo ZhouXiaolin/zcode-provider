@@ -27,11 +27,32 @@ input.on("line", (line) => {
     send({ id, result: { session: { sessionId: "fixture-session" } } });
     return;
   }
-  if (method === "session/setModel" || method === "session/subscribe") {
+  if (method === "session/setModel") {
+    if (process.env.FAKE_ZCODE_PROTOCOL_VARIANT === "modern") {
+      const model = request.params?.model;
+      if (
+        model?.providerId !== "zcode-provider:zai-coding-plan" ||
+        model?.options?.reasoningLevel !== "max"
+      ) {
+        send({ id, error: { message: "modern model materialization was not used" } });
+        return;
+      }
+    }
+    send({ id, result: {} });
+    return;
+  }
+  if (method === "session/subscribe") {
     send({ id, result: {} });
     return;
   }
   if (method === "session/send") {
+    if (
+      process.env.FAKE_ZCODE_PROTOCOL_VARIANT === "modern" &&
+      "runtimeModel" in (request.params ?? {})
+    ) {
+      send({ id, error: { message: "Invalid params: runtimeModel" } });
+      return;
+    }
     turn += 1;
     const answer = `FIXTURE-TURN-${turn}-OK`;
     send({ id, result: {} });
@@ -62,7 +83,16 @@ input.on("line", (line) => {
         kind: "text_end",
         assistantMessageId: `assistant-${turn}`,
       });
-      event("turn.completed", { response: answer });
+      event("turn.completed", {
+        response: answer,
+        usage: {
+          inputTokens: 100,
+          outputTokens: 7,
+          totalTokens: 107,
+          cacheReadTokens: 40,
+          cacheWriteTokens: 0,
+        },
+      });
     }, 500);
     return;
   }

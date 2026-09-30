@@ -32,8 +32,8 @@
 // Flow: session/create {workspace:{workspacePath, workspaceKey}} -> answer
 // session/requestRuntimePreferences (runtime-materialization and
 // user-execution scopes) -> session/subscribe (turns on live session/event
-// notifications) -> session/send {sessionId, content, runtimeModel} -> stream
-// model.streaming / tool.updated / turn.* events -> finish only on the
+// notifications) -> session/send -> stream model.streaming / tool.updated /
+// turn.* events -> finish only on the
 // authoritative session/event turn.completed or turn.failed notification.
 // The app-server bundled with ZCode Desktop 0.16.5 can emit a state.updated
 // prompt_completed snapshot that races with the next turn, so it is not
@@ -71,7 +71,15 @@ import {
 } from "@earendil-works/pi-tui";
 import { spawn, type ChildProcess } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { copyFileSync, existsSync, readFileSync, watch, writeFileSync } from "node:fs";
+import {
+  copyFileSync,
+  existsSync,
+  readFileSync,
+  renameSync,
+  unlinkSync,
+  watch,
+  writeFileSync,
+} from "node:fs";
 import { appendFile } from "node:fs/promises";
 import { createInterface } from "node:readline";
 import { basename, dirname } from "node:path";
@@ -82,6 +90,31 @@ const V2_CONFIG_PATH =
   process.env.ZCODE_V2_CONFIG ?? `${process.env.HOME ?? "~"}/.zcode/v2/config.json`;
 const V2_SETTING_PATH =
   process.env.ZCODE_V2_SETTING ?? `${process.env.HOME ?? "~"}/.zcode/v2/setting.json`;
+const MAC_RESOURCES = "/Applications/ZCode.app/Contents/Resources";
+const MODERN_BUNDLED_PROVIDER_PATH = `${MAC_RESOURCES}/config/provider/zcode-builtin.json`;
+const LEGACY_BUNDLED_PROVIDER_PATH = `${MAC_RESOURCES}/glm/provider/zcode-builtin.json`;
+const EXPLICIT_BRIDGE_PROVIDER_CONFIG_PATH = process.env.ZCODE_BRIDGE_PROVIDER_CONFIG;
+// Each pi process gets an immutable path identity. Different extension
+// versions may coexist during upgrades; sharing this generated repository let
+// an old watcher overwrite it while a new app-server was starting.
+const BRIDGE_PROVIDER_CONFIG_PATH =
+  EXPLICIT_BRIDGE_PROVIDER_CONFIG_PATH ??
+  `${process.env.HOME ?? "~"}/.zcode/cli/zcode-provider-provider-config-${process.pid}.json`;
+
+// ZCode Desktop 3.12 moved its provider catalog and changed app-server model
+// materialization. Keep the old protocol as the default for custom commands
+// and older installations; the override also makes both paths testable.
+const MODERN_PROTOCOL = (() => {
+  const override = process.env.ZCODE_PROTOCOL_VARIANT;
+  if (override === "modern") return true;
+  if (override === "legacy") return false;
+  return (
+    !process.env.ZCODE_SERVE_CMD &&
+    process.platform === "darwin" &&
+    existsSync(MODERN_BUNDLED_PROVIDER_PATH) &&
+    !existsSync(LEGACY_BUNDLED_PROVIDER_PATH)
+  );
+})();
 
 // How a message typed in pi while a ZCode turn is running is delivered.
 //   queue: pi queues it; it runs as a new turn after the current one
@@ -134,7 +167,7 @@ function readCatalog(): CatalogModel[] {
         models?: Record<string, { limit?: { context?: number; output?: number } }>;
       }>;
     };
-    return Object.entries(cfg.provider ?? {}).flatMap(([providerId, p]) =>
+    const models = Object.entries(cfg.provider ?? {}).flatMap(([providerId, p]) =>
       Object.entries(p.models ?? {}).map(([modelId, m]) => ({
         id: `${p.name ?? providerId}/${modelId}`,
         providerId,
@@ -143,6 +176,9 @@ function readCatalog(): CatalogModel[] {
         maxTokens: m.limit?.output,
       })),
     );
+    // A previous bridge version may have left a non-reserved alias beside the
+    // Desktop provider. They are the same pi model; never expose duplicates.
+    return [...new Map(models.map((model) => [model.id, model])).values()];
   } catch {
     return [];
   }
@@ -162,6 +198,8 @@ function resolveModelRef(id: string): { providerId: string; modelId: string } {
   if (byName.length === 1) return { providerId: byName[0][0], modelId };
   if (byName.length === 0)
     throw new Error(`provider ${head} not found in ${SETTINGS_PATH}`);
+  const desktopProvider = byName.find(([pid]) => !pid.startsWith("zcode-provider:"));
+  if (desktopProvider) return { providerId: desktopProvider[0], modelId };
   throw new Error(`provider name ${head} is ambiguous in ${SETTINGS_PATH}`);
 }
 
@@ -170,15 +208,55 @@ interface SettingsModel {
   limit?: { context?: number; output?: number };
 }
 
-// The app-server validates a resumed session's model against its per-workspace
-// model catalog, which is populated only by workspace/updateProviderRegistry or
-// by applying a runtimeModel. The bridge sends neither, so every cold resume
+interface FullSettingsProvider extends SettingsProvider {
+  name?: string;
+  kind?: string;
+  headers?: Record<string, string>;
+  options?: {
+    apiKey?: string;
+    baseURL?: string;
+    headers?: Record<string, string>;
+    apiKeyRequired?: boolean;
+  };
+  models?: Record<string, SettingsModel>;
+}
+
+function modernProviderId(providerId: string): string {
+  return providerId.startsWith("builtin:")
+    ? `zcode-provider:${providerId.slice("builtin:".length)}`
+    : providerId;
+}
+
+function reasoningLevelOf(providerId: string, modelId: string): string | undefined {
+  for (const path of [SETTINGS_PATH, V2_CONFIG_PATH]) {
+    try {
+      const cfg = JSON.parse(readFileSync(path, "utf8")) as {
+        provider?: Record<string, FullSettingsProvider>;
+      };
+      const providers = cfg.provider ?? {};
+      const direct = providers[providerId]?.models?.[modelId]?.reasoning;
+      if (direct?.defaultVariant) return direct.defaultVariant;
+      const equivalent = Object.entries(providers).find(
+        ([pid]) => modernProviderId(pid) === modernProviderId(providerId),
+      )?.[1].models?.[modelId]?.reasoning;
+      if (equivalent?.defaultVariant) return equivalent.defaultVariant;
+    } catch {
+      /* try the other ZCode config */
+    }
+  }
+  return undefined;
+}
+
+// Legacy app-servers validate a resumed session's model against their
+// per-workspace model catalog, which is populated by applying a runtimeModel.
+// Without it every cold resume
 // (after the app-server's 10-min idle eviction) sets a session restoreWarning
 // (ZCODE_RUNTIME_MODEL_UNAVAILABLE, "历史任务使用的模型已不可用...") and
 // session/send refuses the turn — even for a model that is in the list. A bare
 // session/setModel does not clear the warning; only applying a runtimeModel
 // does. Build the descriptor from the settings file the app-server already
-// trusts and send it with every session/send.
+// trusts and send it with every legacy session/send. Modern app-servers reject
+// this field and use syncModernProviderRepository instead.
 function runtimeModelOf(
   providerId: string,
   modelId: string,
@@ -271,6 +349,108 @@ function firstModelRef(
   return null;
 }
 
+function writeJsonAtomic(path: string, value: unknown): void {
+  const content = JSON.stringify(value, null, 2) + "\n";
+  let current = "";
+  try {
+    current = readFileSync(path, "utf8");
+  } catch {
+    /* create below */
+  }
+  if (current === content) return;
+  const temporary = `${path}.tmp-${process.pid}-${randomUUID()}`;
+  try {
+    writeFileSync(temporary, content, { mode: 0o600 });
+    renameSync(temporary, path);
+  } finally {
+    try {
+      if (existsSync(temporary)) unlinkSync(temporary);
+    } catch {
+      /* best-effort cleanup */
+    }
+  }
+}
+
+// ZCode 3.12 app-server no longer imports reserved `builtin:*` entries from
+// cli/config.json and rejects the old per-send runtimeModel descriptor. Build
+// its new personal-provider repository under bridge-owned, non-reserved ids.
+// The legacy CLI config remains untouched, which keeps older app-servers
+// working and avoids two pi processes fighting over provider ids.
+function syncModernProviderRepository(): void {
+  if (!MODERN_PROTOCOL) return;
+  try {
+    const cli = JSON.parse(readFileSync(SETTINGS_PATH, "utf8")) as {
+      model?: unknown;
+      provider?: Record<string, FullSettingsProvider>;
+    };
+    const providerRules = new Map<string, unknown>();
+    const providerModelRules = new Map<string, unknown>();
+    for (const [sourceProviderId, provider] of Object.entries(cli.provider ?? {})) {
+      if (provider.enabled === false) continue;
+      const apiKey = provider.options?.apiKey?.trim();
+      if (!apiKey || provider.options?.apiKeyRequired === false) continue;
+      const modelIds = Object.keys(provider.models ?? {});
+      if (modelIds.length === 0) continue;
+      const providerId = modernProviderId(sourceProviderId);
+      const apiType =
+        provider.kind === "anthropic"
+          ? "anthropic-messages"
+          : provider.kind === "openai"
+            ? "openai-responses"
+            : "openai-chat-completions";
+      const headers = { ...provider.headers, ...provider.options?.headers };
+      providerRules.set(providerId, {
+        providerId,
+        ...(provider.name ? { providerName: provider.name } : {}),
+        config: {
+          group: "standard-personal",
+          access: { type: "api-key", apiKey },
+          api: {
+            type: apiType,
+            ...(provider.options?.baseURL ? { baseUrl: provider.options.baseURL } : {}),
+            ...(Object.keys(headers).length > 0 ? { headers } : {}),
+          },
+          personalModelIds: modelIds,
+          modelOrder: modelIds,
+        },
+      });
+      for (const [modelId, model] of Object.entries(provider.models ?? {})) {
+        if (model.limit?.context) {
+          providerModelRules.set(`${providerId}/${modelId}`, {
+            modelId,
+            config: { properties: { contextWindow: model.limit.context } },
+            providerId,
+          });
+        }
+      }
+    }
+    if (providerRules.size === 0) return;
+    const configured = modelRefOf(cli.model);
+    const slash = configured?.indexOf("/") ?? -1;
+    const defaultModelSelection =
+      slash > 0
+        ? {
+            providerId: modernProviderId(configured!.slice(0, slash)),
+            modelId: configured!.slice(slash + 1),
+          }
+        : undefined;
+    writeJsonAtomic(BRIDGE_PROVIDER_CONFIG_PATH, {
+      schemaVersion: 1,
+      config: {
+        providerConfigRules: { providerRules: [...providerRules.values()] },
+        modelConfigRules: {
+          providerModelRules: [...providerModelRules.values()],
+          manualProviderModelRules: [],
+        },
+        ...(defaultModelSelection ? { defaultModelSelection } : {}),
+      },
+    });
+  } catch {
+    // Let the app-server report a useful startup/model error. Never overwrite
+    // unrelated ZCode configuration when the legacy source cannot be parsed.
+  }
+}
+
 // The app-server resolves models only from its settings file, but the ZCode UI
 // writes providers to the v2 config; upsert enabled v2 providers into the
 // settings file so anything configured in ZCode reaches the server (v2 is
@@ -346,10 +526,10 @@ function mergeV2Providers(): string[] {
       if (existsSync(SETTINGS_PATH)) {
         copyFileSync(
           SETTINGS_PATH,
-          `${SETTINGS_PATH}.bak-${new Date().toISOString().replace(/[:.]/g, "-")}`,
+          `${SETTINGS_PATH}.bak-${new Date().toISOString().replace(/[:.]/g, "-")}-${process.pid}-${randomUUID()}`,
         );
       }
-      writeFileSync(SETTINGS_PATH, JSON.stringify(cli, null, 2) + "\n");
+      writeJsonAtomic(SETTINGS_PATH, cli);
     }
     return changed;
   } catch {
@@ -363,7 +543,10 @@ function watchConfigs(): void {
   let timer: NodeJS.Timeout | undefined;
   const onChange = () => {
     clearTimeout(timer);
-    timer = setTimeout(() => mergeV2Providers(), 300);
+    timer = setTimeout(() => {
+      mergeV2Providers();
+      syncModernProviderRepository();
+    }, 300);
   };
   for (const file of [SETTINGS_PATH, V2_CONFIG_PATH]) {
     const dir = dirname(file);
@@ -402,6 +585,18 @@ function defaultServeCmd(): string {
 }
 
 const SERVE_CMD = process.env.ZCODE_SERVE_CMD ?? defaultServeCmd();
+
+function serverEnv(): NodeJS.ProcessEnv {
+  const env = { ...process.env };
+  if (!MODERN_PROTOCOL) return env;
+  if (!env.ZCODE_BUILTIN_PROVIDER_CONFIG_FILE) {
+    env.ZCODE_BUILTIN_PROVIDER_CONFIG_FILE = MODERN_BUNDLED_PROVIDER_PATH;
+  }
+  if (!env.ZCODE_PERSONAL_PROVIDER_CONFIG_FILE) {
+    env.ZCODE_PERSONAL_PROVIDER_CONFIG_FILE = BRIDGE_PROVIDER_CONFIG_PATH;
+  }
+  return env;
+}
 
 const RUNTIME_PREFS = {
   nativeSearchEnhancementsEnabled: false,
@@ -541,8 +736,12 @@ listeners.add((msg) => {
 function startServer(): void {
   if (proc) return;
   mergeV2Providers();
+  syncModernProviderRepository();
   const [bin, ...args] = SERVE_CMD.split(" ");
-  const child = spawn(bin, args, { stdio: ["pipe", "pipe", "inherit"] });
+  const child = spawn(bin, args, {
+    stdio: ["pipe", "pipe", "inherit"],
+    env: serverEnv(),
+  });
   proc = child;
   const rl = createInterface({ input: child.stdout! });
   rl.on("line", (line) => {
@@ -593,6 +792,9 @@ function startServer(): void {
 }
 
 function request<T = unknown>(method: string, params?: unknown): Promise<T> {
+  if (process.env.ZCODE_DEBUG) {
+    console.error(`[zcode-debug] request ${method}: ${JSON.stringify(params)}`);
+  }
   startServer();
   const id = nextId++;
   return new Promise((resolve, reject) => {
@@ -623,6 +825,14 @@ interface ZcodeMessage {
 //       message, code?, detail?, attribution?.statusCode)
 //   session.updated: {taskId, taskKind, status, toolName, command, pid, ...}
 //       (background-task status pushes, e.g. run_in_background bash)
+interface ZcodeUsage {
+  inputTokens?: number;
+  outputTokens?: number;
+  totalTokens?: number;
+  cacheReadTokens?: number;
+  cacheWriteTokens?: number;
+}
+
 interface ZcodeStreamEvent {
   type: string;
   payload?: {
@@ -634,6 +844,7 @@ interface ZcodeStreamEvent {
     toolName?: string;
     reason?: string;
     response?: string;
+    usage?: ZcodeUsage;
     result?: ZcodeToolResult;
     error?: ZcodeTurnError;
     taskId?: string;
@@ -1444,6 +1655,23 @@ function streamSimple(
       }
       if (ev.type === "turn.completed") {
         if (typeof pl.response === "string" && pl.response) finalResponse = pl.response;
+        if (pl.usage) {
+          const cacheRead = pl.usage.cacheReadTokens ?? 0;
+          const cacheWrite = pl.usage.cacheWriteTokens ?? 0;
+          const outputTokens = pl.usage.outputTokens ?? 0;
+          // ZCode's inputTokens includes cached input, while pi tracks cached
+          // tokens separately and sums all four buckets for totalTokens.
+          const inputTokens = Math.max(
+            0,
+            (pl.usage.inputTokens ?? 0) - cacheRead - cacheWrite,
+          );
+          output.usage.input = inputTokens;
+          output.usage.output = outputTokens;
+          output.usage.cacheRead = cacheRead;
+          output.usage.cacheWrite = cacheWrite;
+          output.usage.totalTokens =
+            pl.usage.totalTokens ?? inputTokens + outputTokens + cacheRead + cacheWrite;
+        }
         settled = true;
         turnSettled = true;
         return;
@@ -1543,10 +1771,14 @@ function streamSimple(
       }
     };
 
+    let sourceRef: { providerId: string; modelId: string };
     let ref: { providerId: string; modelId: string };
     let prompt = "";
     try {
-      ref = resolveModelRef(model.id);
+      sourceRef = resolveModelRef(model.id);
+      ref = MODERN_PROTOCOL
+        ? { ...sourceRef, providerId: modernProviderId(sourceRef.providerId) }
+        : sourceRef;
       if (!sessionId) {
         // pi restarted / session restored (`pi --session`): continue the zcode
         // session this pi session used before instead of silently creating a
@@ -1582,7 +1814,17 @@ function streamSimple(
         await request("session/resume", { sessionId });
       }
       if (lastModelId !== model.id) {
-        await request("session/setModel", { sessionId, model: ref });
+        const reasoningLevel = reasoningLevelOf(sourceRef.providerId, sourceRef.modelId);
+        if (process.env.ZCODE_DEBUG) {
+          console.error("[zcode-debug] model selection", { sourceRef, ref, reasoningLevel });
+        }
+        await request("session/setModel", {
+          sessionId,
+          model:
+            MODERN_PROTOCOL && reasoningLevel
+              ? { ...ref, options: { reasoningLevel } }
+              : ref,
+        });
         lastModelId = model.id;
       }
       const last = [...context.messages].reverse().find((m) => m.role === "user");
@@ -1643,11 +1885,16 @@ function streamSimple(
           const deadline = Date.now() + 10_000;
           while (!turnSettled && Date.now() < deadline) await delay(100);
           if (settled) return; // turn completed right at the boundary
-          await request("session/send", {
-            sessionId,
-            content: "go on",
-            runtimeModel: runtimeModelOf(ref.providerId, ref.modelId),
-          });
+          await request(
+            "session/send",
+            MODERN_PROTOCOL
+              ? { sessionId, content: "go on" }
+              : {
+                  sessionId,
+                  content: "go on",
+                  runtimeModel: runtimeModelOf(sourceRef.providerId, sourceRef.modelId),
+                },
+          );
           timer.refresh?.(); // restart the budget for the continuation
         } catch (e) {
           listeners.delete(onEvent);
@@ -1669,13 +1916,19 @@ function streamSimple(
       // ZCode-native steer mode (guide): make the session inject inputs sent
       // while the turn is running at the next tool/message boundary.
       await setupGuideMode(sessionId);
-      // runtimeModel clears the app-server's restoreWarning on cold resumes (see
-      // runtimeModelOf) and keeps the workspace model catalog populated.
-      await request("session/send", {
-        sessionId,
-        content: prompt,
-        runtimeModel: runtimeModelOf(ref.providerId, ref.modelId),
-      });
+      // Legacy app-servers need runtimeModel to recover cold sessions. Modern
+      // app-servers materialize the bridge-owned provider repository at start
+      // and reject runtimeModel as an unknown parameter.
+      await request(
+        "session/send",
+        MODERN_PROTOCOL
+          ? { sessionId, content: prompt }
+          : {
+              sessionId,
+              content: prompt,
+              runtimeModel: runtimeModelOf(sourceRef.providerId, sourceRef.modelId),
+            },
+      );
       turnActive = true;
     } catch (e) {
       listeners.delete(onEvent);
@@ -1741,6 +1994,7 @@ function toPiModels(catalog: CatalogModel[]) {
 
 export default function (pi: ExtensionAPI) {
   mergeV2Providers();
+  syncModernProviderRepository();
   // Capture the pi UI context so interaction/requestUserInput (askUserQuestion)
   // can show its dialog from the app-server's request handler.
   pi.on("session_start", (_event, ctx) => {
@@ -1843,5 +2097,12 @@ export default function (pi: ExtensionAPI) {
     }
     proc?.kill();
     proc = null;
+    if (!EXPLICIT_BRIDGE_PROVIDER_CONFIG_PATH) {
+      try {
+        if (existsSync(BRIDGE_PROVIDER_CONFIG_PATH)) unlinkSync(BRIDGE_PROVIDER_CONFIG_PATH);
+      } catch {
+        /* best-effort cleanup of the process-scoped provider snapshot */
+      }
+    }
   });
 }

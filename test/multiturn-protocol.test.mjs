@@ -56,7 +56,7 @@ test("ignores racy prompt_completed snapshots across consecutive turns", async (
     },
   })}\n`);
 
-  const state = { waiters: [], text: [] };
+  const state = { waiters: [], text: [], usages: [] };
   const child = spawn(
     process.env.PI_BIN || "pi",
     [
@@ -86,6 +86,7 @@ test("ignores racy prompt_completed snapshots across consecutive turns", async (
           .filter((part) => part.type === "text")
           .map((part) => part.text || ""),
       );
+      state.usages.push(event.message.usage);
     }
     if (event.type === "agent_end") {
       state.waiters.shift()?.resolve(state.text);
@@ -102,6 +103,14 @@ test("ignores racy prompt_completed snapshots across consecutive turns", async (
       const answer = await sendPrompt(child, String(turn), `turn ${turn}`, state);
       assert.deepEqual(answer, [`FIXTURE-TURN-${turn}-OK`]);
     }
+    assert.deepEqual(state.usages.at(-1), {
+      input: 60,
+      output: 7,
+      cacheRead: 40,
+      cacheWrite: 0,
+      totalTokens: 107,
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+    });
     const merged = JSON.parse(await readFile(settings, "utf8"));
     assert.equal(merged.provider["stale-provider"], undefined);
   } finally {
