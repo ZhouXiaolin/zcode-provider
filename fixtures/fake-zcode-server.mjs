@@ -32,11 +32,21 @@ input.on("line", (line) => {
       const model = request.params?.model;
       if (
         model?.providerId !== "zcode-provider:zai-coding-plan" ||
-        model?.options?.reasoningLevel !== "max"
+        model?.options?.reasoningLevel !==
+          (process.env.FAKE_EXPECT_REASONING_LEVEL ?? "max")
       ) {
         send({ id, error: { message: "modern model materialization was not used" } });
         return;
       }
+    }
+    send({ id, result: {} });
+    return;
+  }
+  if (method === "session/setThoughtLevel") {
+    const expected = process.env.FAKE_EXPECT_THOUGHT_LEVEL;
+    if (expected && request.params?.thoughtLevel !== expected) {
+      send({ id, error: { message: "unexpected reasoning level" } });
+      return;
     }
     send({ id, result: {} });
     return;
@@ -54,7 +64,10 @@ input.on("line", (line) => {
       return;
     }
     turn += 1;
-    const answer = `FIXTURE-TURN-${turn}-OK`;
+    const answer =
+      turn === 1 && process.env.FAKE_ZCODE_FIRST_RESPONSE_CHARS
+        ? "X".repeat(Number(process.env.FAKE_ZCODE_FIRST_RESPONSE_CHARS))
+        : `FIXTURE-TURN-${turn}-OK`;
     send({ id, result: {} });
 
     // Reproduce the observed second-turn race: prompt_completed from prior
@@ -74,6 +87,16 @@ input.on("line", (line) => {
     }
 
     setTimeout(() => {
+      if (process.env.FAKE_ZCODE_AUTO_COMPACT === "1") {
+        event("session.updated", {
+          operationId: "fixture-auto-compact",
+          status: "completed",
+          trigger: "auto",
+          compactReason: "context_limit",
+          preCompactTokenCount: 980_000,
+          truePostCompactTokenCount: 72_000,
+        });
+      }
       event("model.streaming", {
         kind: "text_delta",
         assistantMessageId: `assistant-${turn}`,
@@ -94,6 +117,40 @@ input.on("line", (line) => {
         },
       });
     }, 500);
+    return;
+  }
+  if (method === "session/read") {
+    send({
+      id,
+      result: {
+        runtime: {
+          contextUsage: {
+            used: turn > 0 ? 87 : 0,
+            size: 200_000,
+            cache: {
+              inputTokens: 80,
+              cacheReadTokens: 30,
+              cacheWriteTokens: 0,
+            },
+          },
+        },
+        settings: {
+          model: {
+            available: [{
+              ref: {
+                providerId: "zcode-provider:zai-coding-plan",
+                modelId: "GLM-5.3-Flash",
+              },
+              contextWindow: 200_000,
+              maxOutputTokens: 128_000,
+              reasoning: {
+                levels: ["low", "high", "max"].map((value) => ({ value, label: value })),
+              },
+            }],
+          },
+        },
+      },
+    });
     return;
   }
   if (method === "session/messages") {

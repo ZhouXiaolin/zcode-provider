@@ -55,7 +55,7 @@ test("supports the modern provider repository and protocol", async () => {
     [
       "--mode", "rpc", "--no-session", "--no-extensions", "--extension", extension,
       "--provider", "zcode", "--model", "Z.ai - Coding Plan/GLM-5.3-Flash",
-      "--no-tools", "--no-context-files", "--no-skills", "--no-prompt-templates",
+      "--thinking", "high", "--no-tools", "--no-context-files", "--no-skills", "--no-prompt-templates",
       "--no-themes",
     ],
     {
@@ -68,6 +68,7 @@ test("supports the modern provider repository and protocol", async () => {
         ZCODE_BRIDGE_PROVIDER_CONFIG: bridge,
         ZCODE_PROTOCOL_VARIANT: "modern",
         FAKE_ZCODE_PROTOCOL_VARIANT: "modern",
+        FAKE_EXPECT_REASONING_LEVEL: "high",
       },
       stdio: ["pipe", "pipe", "pipe"],
     },
@@ -94,12 +95,14 @@ test("supports the modern provider repository and protocol", async () => {
     child.stdin.write(`${JSON.stringify({ id: "1", type: "prompt", message: "ping" })}\n`);
     const message = await result;
     assert.equal(message.content.find((part) => part.type === "text")?.text, "FIXTURE-TURN-1-OK");
+    // turn.completed reports 107 cumulative tokens across ZCode's hidden
+    // agent loop; the final app-server context snapshot is 87 tokens.
     assert.deepEqual(message.usage, {
-      input: 60,
+      input: 50,
       output: 7,
-      cacheRead: 40,
+      cacheRead: 30,
       cacheWrite: 0,
-      totalTokens: 107,
+      totalTokens: 87,
       cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
     });
     const repository = JSON.parse(await readFile(bridge, "utf8"));
