@@ -16,7 +16,10 @@ for (const includeCodingPlan of [true, false]) test(`Pi authenticates two Start 
   const providerId = "account:zai-start-plan", modelId = "GLM-5.3-Flash";
   const legacyProvider = { name: "Z.ai - Coding Plan", enabled: true, kind: "anthropic",
     options: { apiKey: "fixture-coding-key", baseURL: "https://example.invalid" }, models: { [modelId]: {} } };
-  await writeFile(join(dir, "desktop.json"), JSON.stringify({ provider: includeCodingPlan ? { "builtin:zai-coding-plan": legacyProvider } : {} }));
+  await writeFile(join(dir, "desktop.json"), JSON.stringify({ provider: includeCodingPlan ? {
+    "builtin:zai-coding-plan": legacyProvider,
+    "legacy-start-alias": { ...legacyProvider, name: "Z.ai - Start Plan" },
+  } : {} }));
   await writeFile(bundle, JSON.stringify({ revision: 30, config: {
     providerConfigRules: { providerRules: [{ providerId, config: {
       access: { type: "zhipu-account", mode: "start-plan", accountType: "zai" }, builtinModelIds: [modelId],
@@ -59,6 +62,7 @@ for (const includeCodingPlan of [true, false]) test(`Pi authenticates two Start 
     if (messages.length === 1 && event.message.stopReason !== "error") send({ type: "prompt", message: "second" });
     else resolveDone();
   });
+  child.on("error", rejectDone);
   child.on("exit", code => rejectDone(new Error(`Pi exited ${code}: ${stderr}`)));
   try {
     send({ type: "get_available_models" });
@@ -66,7 +70,7 @@ for (const includeCodingPlan of [true, false]) test(`Pi authenticates two Start 
     await done;
     assert.equal(messages.length, 2, `${stderr}\n${messages.map(message => message.errorMessage).join("\n")}`);
     assert.deepEqual(messages.map(message => message.content.find(part => part.type === "text")?.text), ["START-1-OK", "START-2-OK"]);
-    assert.ok(catalog.some(model => model.id === "Z.ai - Start Plan/GLM-5.3-Flash"));
+    assert.equal(catalog.filter(model => model.id === "Z.ai - Start Plan/GLM-5.3-Flash").length, 1);
     assert.equal(catalog.some(model => model.id === "Z.ai - Coding Plan/GLM-5.3-Flash"), includeCodingPlan);
     const events = (await readFile(trace, "utf8")).trim().split("\n").map(line => JSON.parse(line));
     assert.equal(events.filter(event => event.accountReady).length, 2);
@@ -78,7 +82,9 @@ for (const includeCodingPlan of [true, false]) test(`Pi authenticates two Start 
     assert.ok(!stdout.includes("fixture-jwt"));
   } finally {
     clearTimeout(timer);
-    const exit = new Promise(resolve => child.once("exit", resolve));
+    const exit = child.exitCode !== null || child.signalCode !== null
+      ? Promise.resolve()
+      : new Promise(resolve => child.once("exit", resolve));
     child.kill("SIGTERM");
     await exit;
     lines.close();

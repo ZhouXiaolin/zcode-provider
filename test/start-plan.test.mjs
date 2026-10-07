@@ -154,6 +154,55 @@ test("long turns revalidate expired grants and fail closed when the package expi
   await assert.rejects(client.runtimeAuth(authParams()), /Unexpected/);
 });
 
+test("long turns renew a still-valid grant for the same account", async t => {
+  let clock = nowMs;
+  let requests = 0;
+  const { client } = fixture(t, async () => {
+    requests += 1;
+    const payload = balance();
+    payload.data.server_time = clock / 1000;
+    payload.data.balances[0].expires_at = nowMs / 1000 + 3600;
+    return Response.json(payload);
+  }, () => clock);
+  await client.prepare(providerId, modelId);
+  clock += 301000;
+  assert.equal((await client.runtimeAuth(authParams())).requestAuth.apiKey, "fixture-token");
+  assert.equal(requests, 2);
+});
+
+test("expired prepared grants cannot silently switch to a newly signed-in account", async t => {
+  let clock = nowMs;
+  const { client, credentials, login, calls } = fixture(t, undefined, () => clock);
+  await client.prepare(providerId, modelId);
+  clock += 61000;
+  writeFileSync(credentials, JSON.stringify({ ...login, zcodejwttoken: "different-account-token" }));
+  await assert.rejects(client.runtimeAuth(authParams()), /login changed/);
+  assert.equal(calls.length, 1, "must reject identity change before fetching a replacement grant");
+});
+
+test("clearing authorization prevents an in-flight balance check from restoring it", async t => {
+  let resolveResponse;
+  const { client } = fixture(t, () => new Promise(resolve => { resolveResponse = resolve; }));
+  const pending = client.prepare(providerId, modelId);
+  client.clear();
+  resolveResponse(Response.json(balance()));
+  await assert.rejects(pending, /cancelled or superseded/);
+  await assert.rejects(client.runtimeAuth(authParams()), /Unexpected/);
+});
+
+test("a superseded balance check cannot replace the newer authorization", async t => {
+  const responses = [];
+  const { client } = fixture(t, () => new Promise(resolve => { responses.push(resolve); }));
+  const first = client.prepare(providerId, modelId);
+  const firstRejected = assert.rejects(first, /cancelled or superseded/);
+  const second = client.prepare(providerId, modelId);
+  responses[1](Response.json(balance()));
+  await second;
+  responses[0](Response.json(balance()));
+  await firstRejected;
+  assert.equal((await client.runtimeAuth(authParams())).requestAuth.apiKey, "fixture-token");
+});
+
 test("account changes during entitlement lookup cannot authorize either account", async t => {
   let resolveResponse;
   const { client, credentials, login } = fixture(t, () => new Promise(resolve => { resolveResponse = resolve; }));

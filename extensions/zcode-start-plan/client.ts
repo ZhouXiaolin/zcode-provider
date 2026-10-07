@@ -45,6 +45,7 @@ export interface StartPlanOptions {
 
 export class StartPlanClient {
   private prepared?: PreparedPlan;
+  private generation = 0;
   private options: StartPlanOptions;
 
   constructor(options: StartPlanOptions) { this.options = options; }
@@ -79,12 +80,16 @@ export class StartPlanClient {
   }
 
   async prepare(providerId: string, modelId: string, signal?: AbortSignal) {
+    const generation = ++this.generation;
     this.prepared = undefined;
     signal?.throwIfAborted();
     if (!this.catalog().some((model) => model.providerId === providerId && model.modelId === modelId)) {
       throw new Error("Start Plan model is disabled or its ZCode account is signed out. Reopen /model after signing in to Desktop.");
     }
-    const login = readStartPlanLogin(this.options.directory, this.options.env)!;
+    const login = readStartPlanLogin(this.options.directory, this.options.env);
+    if (!login || `account:${login.family}-start-plan` !== providerId) {
+      throw new Error("ZCode login changed before checking Start Plan. Retry the request.");
+    }
     const appVersion = this.appVersion();
     const url = new URL(BALANCE_URL);
     url.searchParams.set("app_version", appVersion);
@@ -114,8 +119,9 @@ export class StartPlanClient {
     if (latestLogin?.family !== login.family || latestLogin.token !== login.token) {
       throw new Error("ZCode login changed while checking Start Plan. Retry the request.");
     }
-    this.prepared = { providerId, modelIds, tokenHash: hash(login.token), expiresAtMs: grant.expiresAtMs };
+    if (generation !== this.generation) throw new Error("Start Plan authorization was cancelled or superseded.");
     const bundle = this.bundle();
+    this.prepared = { providerId, modelIds, tokenHash: hash(login.token), expiresAtMs: grant.expiresAtMs };
     const providers = { [providerId]: { access: { type: "zhipu-account", entitled: true }, builtinModelIds: modelIds } };
     const states = { [providerId]: { availability: "available", entitled: true, current: true } };
     return {
@@ -139,17 +145,28 @@ export class StartPlanClient {
     }
     if (params.reason === "captcha-retry") throw new Error("Start Plan requires CAPTCHA verification. Complete it in ZCode Desktop, then retry in Pi.");
     signal?.throwIfAborted();
+    this.requirePreparedLogin(prepared);
     if ((this.options.now ?? Date.now)() >= prepared.expiresAtMs) {
       await this.prepare(prepared.providerId, modelId, signal);
     }
-    const login = readStartPlanLogin(this.options.directory, this.options.env);
-    if (!login || `account:${login.family}-start-plan` !== prepared.providerId || hash(login.token) !== this.prepared?.tokenHash) {
-      throw new Error("ZCode login changed or expired. Sign in to Desktop and retry; no fallback was made.");
-    }
+    signal?.throwIfAborted();
+    const login = this.requirePreparedLogin(prepared);
     return { headersApplied: true, requestAuth: { apiKey: login.token, headers: this.sourceHeaders(this.appVersion()) } };
   }
 
-  clear() { this.prepared = undefined; }
+  clear() {
+    this.generation += 1;
+    this.prepared = undefined;
+  }
+
+  private requirePreparedLogin(prepared: PreparedPlan) {
+    const login = readStartPlanLogin(this.options.directory, this.options.env);
+    if (!this.prepared || !login || `account:${login.family}-start-plan` !== prepared.providerId ||
+        hash(login.token) !== prepared.tokenHash || this.prepared.tokenHash !== prepared.tokenHash) {
+      throw new Error("ZCode login changed or expired. Sign in to Desktop and retry; no fallback was made.");
+    }
+    return login;
+  }
 
   private bundle(): Bundle {
     try {

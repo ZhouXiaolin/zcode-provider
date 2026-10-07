@@ -200,7 +200,8 @@ function readCatalog(): CatalogModel[] {
     try { startPlanModels = startPlanClient.catalog(); }
     catch (error) { console.warn(`[zcode] ${error instanceof Error ? error.message : "Start Plan discovery failed"}`); }
   }
-  return [...readLegacyCatalog(), ...startPlanModels];
+  const models = [...readLegacyCatalog(), ...startPlanModels];
+  return [...new Map(models.map((model) => [model.id, model])).values()];
 }
 
 function readLegacyCatalog(): CatalogModel[] {
