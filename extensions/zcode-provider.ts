@@ -84,6 +84,7 @@ import {
 import { appendFile } from "node:fs/promises";
 import { createInterface } from "node:readline";
 import { basename, dirname } from "node:path";
+import { StartPlanClient } from "./zcode-start-plan/client";
 
 const SETTINGS_PATH =
   process.env.ZCODE_SETTINGS ?? `${process.env.HOME ?? "~"}/.zcode/cli/config.json`;
@@ -149,6 +150,13 @@ const TURN_TIMEOUT_MS = (() => {
   return Number.isFinite(n) && n > 0 ? n : 30 * 60 * 1000;
 })();
 
+const startPlanClient = new StartPlanClient({
+  directory: dirname(V2_CONFIG_PATH),
+  bundledPath: process.env.ZCODE_BUILTIN_PROVIDER_CONFIG_FILE ?? MODERN_BUNDLED_PROVIDER_PATH,
+  env: process.env,
+});
+let startPlanAuthContext: { sessionId: string; signal: AbortSignal } | undefined;
+
 interface CatalogModel {
   id: string; // `${providerName}/${modelId}`, the pi model id
   providerId: string;
@@ -187,6 +195,16 @@ function thinkingLevelMapOf(variants: string[] | undefined): ThinkingLevelMap | 
 // v2 config the ZCode UI writes is not read. Keep a fallback single model so an
 // unreadable/absent settings file still yields a working bridge.
 function readCatalog(): CatalogModel[] {
+  let startPlanModels: CatalogModel[] = [];
+  if (MODERN_PROTOCOL) {
+    try { startPlanModels = startPlanClient.catalog(); }
+    catch (error) { console.warn(`[zcode] ${error instanceof Error ? error.message : "Start Plan discovery failed"}`); }
+  }
+  const models = [...readLegacyCatalog(), ...startPlanModels];
+  return [...new Map(models.map((model) => [model.id, model])).values()];
+}
+
+function readLegacyCatalog(): CatalogModel[] {
   try {
     const cfg = JSON.parse(readFileSync(SETTINGS_PATH, "utf8")) as {
       provider?: Record<string, {
@@ -216,6 +234,12 @@ function readCatalog(): CatalogModel[] {
 }
 
 function resolveModelRef(id: string): { providerId: string; modelId: string } {
+  if (/^(Z\.ai|BigModel) - Start Plan\//.test(id)) {
+    if (!MODERN_PROTOCOL) throw new Error("Start Plan requires the modern ZCode app-server.");
+    const selected = startPlanClient.catalog().find((model) => model.id === id);
+    if (!selected) throw new Error("Start Plan model is disabled or signed out. Sign in to ZCode Desktop, then reopen /model.");
+    return { providerId: selected.providerId, modelId: selected.modelId };
+  }
   const slash = id.indexOf("/");
   if (slash < 0) throw new Error(`unknown zcode model: ${id}`);
   const head = id.slice(0, slash);
@@ -410,7 +434,7 @@ function writeJsonAtomic(path: string, value: unknown): void {
 function syncModernProviderRepository(): void {
   if (!MODERN_PROTOCOL) return;
   try {
-    const cli = JSON.parse(readFileSync(SETTINGS_PATH, "utf8")) as {
+    const cli = (existsSync(SETTINGS_PATH) ? JSON.parse(readFileSync(SETTINGS_PATH, "utf8")) : {}) as {
       model?: unknown;
       provider?: Record<string, FullSettingsProvider>;
     };
@@ -455,7 +479,6 @@ function syncModernProviderRepository(): void {
         }
       }
     }
-    if (providerRules.size === 0) return;
     const configured = modelRefOf(cli.model);
     const slash = configured?.indexOf("/") ?? -1;
     const defaultModelSelection =
@@ -806,6 +829,24 @@ function startServer(): void {
           result: { decision: allow ? "allow" : "deny", reason: "pi zcode bridge" },
         }) + "\n",
       );
+    } else if (msg.method === "interaction/requestProviderRuntimeHeaders") {
+      const auth = startPlanAuthContext;
+      const respond = (result: unknown) => {
+        if (proc === child && child.stdin?.writable) {
+          child.stdin.write(JSON.stringify({ id: msg.id, result }) + "\n");
+        }
+      };
+      if (!auth || msg.params?.sessionId !== auth.sessionId) {
+        respond({ headersApplied: false, errorMessage: "No active Start Plan authorization for this session." });
+      } else {
+        void startPlanClient.runtimeAuth(msg.params, auth.signal).then(
+          (result) => {
+            if (startPlanAuthContext === auth && !auth.signal.aborted) respond(result);
+            else respond({ headersApplied: false, errorMessage: "Start Plan request was cancelled." });
+          },
+          (error) => respond({ headersApplied: false, errorMessage: error instanceof Error ? error.message : "Start Plan authorization failed." }),
+        );
+      }
     } else if (msg.method === "interaction/requestUserInput") {
       // ZCode's askUserQuestion tool: the model asks the user. Show the
       // question dialog in pi and answer with the user's choice so the ZCode
@@ -820,6 +861,8 @@ function startServer(): void {
     sessionId = null;
     lastModelId = null;
     lastThoughtLevel = null;
+    startPlanAuthContext = undefined;
+    startPlanClient.clear();
     guideSessions.clear();
     for (const [, p] of pending) p.reject(err);
     pending.clear();
@@ -1596,8 +1639,13 @@ function streamSimple(
 
   (async () => {
     out.push({ type: "start", partial: output });
+    const authController = new AbortController();
+    const authSignal = options?.signal ? AbortSignal.any([options.signal, authController.signal]) : authController.signal;
     const finish = (reason: "stop" | "error" | "aborted", errorMessage?: string) => {
       if (output.stopReason !== "pending") return;
+      authController.abort();
+      startPlanAuthContext = undefined;
+      startPlanClient.clear();
       // Close any bash blocks still awaiting their result so every text block
       // ends (pi finalizes messages on text_end).
       flushPendingBashBlocks();
@@ -1906,6 +1954,11 @@ function streamSimple(
       ref = MODERN_PROTOCOL
         ? { ...sourceRef, providerId: modernProviderId(sourceRef.providerId) }
         : sourceRef;
+      if (/^account:(zai|bigmodel)-start-plan$/.test(ref.providerId)) {
+        const accountConfig = await startPlanClient.prepare(ref.providerId, ref.modelId, authSignal);
+        authSignal.throwIfAborted();
+        await request("provider/updateAccountConfig", accountConfig);
+      }
       if (!sessionId) {
         // pi restarted / session restored (`pi --session`): continue the zcode
         // session this pi session used before instead of silently creating a
@@ -1941,6 +1994,9 @@ function streamSimple(
         // persisted store when evicted, so multi-turn continuity survives idle
         // gaps without ever surfacing that error.
         await request("session/resume", { sessionId });
+      }
+      if (/^account:(zai|bigmodel)-start-plan$/.test(ref.providerId)) {
+        startPlanAuthContext = { sessionId, signal: authSignal };
       }
       const requestedThinking = options?.reasoning;
       const mappedThinking = requestedThinking
@@ -1999,8 +2055,9 @@ function streamSimple(
           ? last.content
           : (last?.content ?? []).map((c) => (c.type === "text" ? c.text : "")).join("");
       if (!prompt) throw new Error("no user message in context");
+      authSignal.throwIfAborted();
     } catch (e) {
-      finish("error", e instanceof Error ? e.message : String(e));
+      finish(options?.signal?.aborted ? "aborted" : "error", e instanceof Error ? e.message : String(e));
       return;
     }
 
@@ -2082,6 +2139,7 @@ function streamSimple(
       // ZCode-native steer mode (guide): make the session inject inputs sent
       // while the turn is running at the next tool/message boundary.
       await setupGuideMode(sessionId);
+      authSignal.throwIfAborted();
       // Legacy app-servers need runtimeModel to recover cold sessions. Modern
       // app-servers materialize the bridge-owned provider repository at start
       // and reject runtimeModel as an unknown parameter.
@@ -2281,6 +2339,8 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("session_shutdown", async () => {
+    startPlanAuthContext = undefined;
+    startPlanClient.clear();
     turnActive = false;
     guideSessions.clear();
     v4StateBySession.clear();

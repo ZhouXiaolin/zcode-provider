@@ -35,9 +35,31 @@ After installing, run `/reload` inside pi, then `/model` and pick a ZCode model,
 e.g. `火山/glm-latest` or `Z.ai - Coding Plan/GLM-5.3`. Switching models
 mid-conversation works via ZCode's `session/setModel`.
 
+## Start Plan token packages
+
+On supported modern ZCode installations, `/model` offers separate entries:
+
+- `Z.ai - Coding Plan/GLM-5.3-Flash` — the configured Coding Plan access.
+- `Z.ai - Start Plan/GLM-5.3-Flash` — the signed-in Desktop account's Start Plan
+  package, including Trust Build grants. BigModel accounts use `BigModel - Start Plan/...`.
+
+Select the desired plan explicitly. There is **no automatic fallback** between
+plans. The catalog lists bundled Start Plan models; your particular package may
+cover only some of them. Its active balance and model coverage are checked before
+every turn. Expired, exhausted, pending or missing grants fail without charging a
+different plan. Desktop model-disable preferences are honored.
+
+Keep ZCode Desktop signed in. Login refresh and CAPTCHA verification remain in
+Desktop; after completing them, retry in Pi. The bridge reads the shared login
+without changing it and never writes the Start Plan JWT into its generated
+provider repository. Reload Pi after installing this change.
+
+See [Start Plan integration](extensions/zcode-start-plan/README.md) for protocol,
+security boundaries and compatibility details.
+
 ## How model selection works
 
-ZCode's app-server resolves models only from its settings file
+The legacy ZCode app-server resolves models only from its settings file
 (`~/.zcode/cli/config.json`), while the ZCode UI writes providers to
 `~/.zcode/v2/config.json`. This extension:
 
@@ -78,6 +100,8 @@ Environment variables (set before starting pi):
 | `ZCODE_STEER_MODE` | auto | How a message typed in pi while a ZCode turn is running is handled, using ZCode's own two delivery modes: `queue` (processed as a new turn after the current one completes — pi's standard behavior) or `guide` (sent to the running session via ZCode's v4 command channel and injected at the next tool/message boundary inside the same turn, falling back to a queue when the turn is not steerable). Default follows ZCode's own UI setting (`zcodeInteractionBehavior` in `~/.zcode/v2/setting.json`): `guide` when ZCode is configured for guide-mode interaction, else `queue`. Set explicitly to override |
 | `ZCODE_PROTOCOL_VARIANT` | auto | Compatibility override: `legacy` for the Desktop 0.16.5 app-server protocol, or `modern` for ZCode Desktop 3.12+. Normally auto-detected from the macOS application layout. Custom `ZCODE_SERVE_CMD` commands default to `legacy` unless this is set. |
 | `ZCODE_BRIDGE_PROVIDER_CONFIG` | process-scoped file under `~/.zcode/cli/` | Optional fixed path for the bridge-owned provider repository used by the modern app-server. By default each pi process gets its own atomic snapshot so old and new extension processes cannot overwrite one another during upgrades. It never replaces Desktop's own provider repository. |
+| `ZCODE_APP_VERSION` | installed macOS Desktop version | Desktop version for Start Plan billing headers. Required when it cannot be detected from the app bundle. |
+| `ZCODE_BUILTIN_PROVIDER_CONFIG_FILE` | bundled modern provider catalog | Override shared by the app-server and Start Plan discovery; must refer to the matching installed ZCode catalog. |
 
 ## Testing
 
@@ -92,6 +116,20 @@ The fake is **not an official or complete ZCode protocol implementation**. It
 models only the NDJSON messages needed by this regression test, based on event
 ordering observed from the app-server bundled with ZCode Desktop 0.16.5. It
 should be revalidated against the real app-server when ZCode's protocol changes.
+
+Start Plan tests cover explicit model selection, native account authorization,
+consecutive turns, expired/exhausted grants, login changes, cancellation and
+credential isolation. They are offline fakes based on Desktop 3.14.4 behavior.
+An optional live smoke test uses a small amount of the signed-in account's quota:
+
+```sh
+node scripts/smoke-start-plan.mjs
+```
+
+It requests two short replies in a temporary workspace with permissions denied.
+Set `SMOKE_EXTENSION` to validate a separately installed extension or `SMOKE_MODEL`
+to select another Start Plan model. Neither the source tests nor this script are
+included in the npm runtime package.
 
 ## Security
 
