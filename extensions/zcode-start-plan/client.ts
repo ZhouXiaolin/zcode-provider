@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { readFileSync } from "node:fs";
+import { closeSync, openSync, readFileSync, readSync } from "node:fs";
 import { arch, platform, version } from "node:os";
 import { join, resolve } from "node:path";
 import { readStartPlanLogin } from "./credentials";
@@ -197,8 +197,35 @@ export class StartPlanClient {
       const plist = readFileSync(resolve(this.options.bundledPath, "../../../../Info.plist"), "utf8");
       const version = plist.match(/<key>CFBundleShortVersionString<\/key>\s*<string>([^<]+)<\/string>/)?.[1];
       if (version) return version;
-    } catch { /* Non-macOS installations can supply ZCODE_APP_VERSION. */ }
+    } catch { /* Not a macOS .app install; try the Linux electron-updater layout. */ }
+    const asarVersion = this.linuxAsarAppVersion();
+    if (asarVersion) return asarVersion;
     throw new Error("Set ZCODE_APP_VERSION to your installed Desktop version to use Start Plan.");
+  }
+
+  // Linux electron-updater installs keep the app in <resources>/app.asar, whose
+  // package.json carries the Desktop version (e.g. /opt/ZCode/resources/app.asar).
+  private linuxAsarAppVersion(): string | undefined {
+    try {
+      const fd = openSync(resolve(this.options.bundledPath, "../../../app.asar"), "r");
+      try {
+        const sizes = Buffer.alloc(16);
+        if (readSync(fd, sizes, 0, 16, 0) !== 16 || sizes.readUInt32LE(0) !== 4) return undefined;
+        const jsonSize = sizes.readUInt32LE(12);
+        const header = Buffer.alloc(jsonSize);
+        if (readSync(fd, header, 0, jsonSize, 16) !== jsonSize) return undefined;
+        const entry = JSON.parse(header.toString("utf8")).files?.["package.json"];
+        if (!entry || typeof entry.offset !== "string" || typeof entry.size !== "number") return undefined;
+        const pkg = Buffer.alloc(entry.size);
+        if (readSync(fd, pkg, 0, entry.size, 8 + sizes.readUInt32LE(4) + Number(entry.offset)) !== entry.size) return undefined;
+        const version = JSON.parse(pkg.toString("utf8")).version;
+        return typeof version === "string" && version.trim() ? version.trim() : undefined;
+      } finally {
+        closeSync(fd);
+      }
+    } catch {
+      return undefined;
+    }
   }
 
   private sourceHeaders(appVersion: string): Record<string, string> {

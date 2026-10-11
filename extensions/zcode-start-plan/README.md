@@ -43,10 +43,12 @@ The local app-server still receives credentials in memory, as it does in Desktop
 Desktop owns sign-in, token renewal and CAPTCHA. CAPTCHA retries fail with an
 instruction to complete verification in Desktop; this extension does not solve
 or bypass it. Network/account/entitlement failures do not fall back to a cached
-positive grant or to Coding Plan. Linux/custom installations need the matching
-modern protocol/catalog paths and `ZCODE_APP_VERSION`; they have not had a live
-compatibility test. BigModel discovery and account separation have deterministic
-tests; the live smoke was performed with Z.ai.
+positive grant or to Coding Plan. Linux electron-updater installs (deb at
+`/opt/ZCode`) are auto-detected like macOS: the catalog is read from
+`resources/config/provider/zcode-builtin.json` and the Desktop version from
+`app.asar`'s package.json (override with `ZCODE_APP_VERSION`). Live-tested with
+Desktop 3.14.5 on Linux. BigModel discovery and account separation have
+deterministic tests; the live smoke was performed with Z.ai.
 
 See the root [testing instructions](../../README.md#testing) for the offline
 regressions and the opt-in live smoke test.
