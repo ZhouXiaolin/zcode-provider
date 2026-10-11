@@ -7,6 +7,11 @@ const source = await readFile(
   "utf8",
 );
 
+const clientSource = await readFile(
+  new URL("../extensions/zcode-start-plan/client.ts", import.meta.url),
+  "utf8",
+);
+
 test("only explicitly enabled Desktop providers are synchronized", () => {
   assert.match(source, /enabled\?: boolean \}\)\.enabled !== true/);
 });
@@ -44,4 +49,57 @@ test("only exact ZCode reasoning variants are exposed to Pi", () => {
   assert.match(source, /xhigh: available\.has\("xhigh"\) \? "xhigh" : null/);
   assert.match(source, /medium: available\.has\("medium"\) \? "medium" : null/);
   assert.match(source, /"session\/setThoughtLevel"/);
+});
+
+test("modern layout detection works on every platform, not only darwin", () => {
+  // ZCode Desktop 3.12+ ships the moved catalog on Linux too (deb at /opt/ZCode);
+  // detection must come from the install layout, never from process.platform.
+  const detection = source.slice(
+    source.indexOf("const MODERN_PROTOCOL"),
+    source.indexOf("const STEER_MODE"),
+  );
+  assert.doesNotMatch(detection, /process\.platform === ["']darwin["']/);
+  assert.match(source, /LINUX_RESOURCES = "\/opt\/ZCode\/resources"/);
+  assert.match(source, /`\$\{LINUX_RESOURCES\}\/config\/provider\/zcode-builtin\.json`/);
+  assert.match(source, /`\$\{LINUX_RESOURCES\}\/glm\/provider\/zcode-builtin\.json`/);
+  // An explicit catalog override must win over the layout scan.
+  assert.match(
+    source,
+    /MODERN_BUNDLED_PROVIDER_PATH =\s*\n\s*process\.env\.ZCODE_BUILTIN_PROVIDER_CONFIG_FILE \?\?/,
+  );
+});
+
+test("Start Plan app version falls back to the Linux app.asar package.json", () => {
+  assert.match(clientSource, /linuxAsarAppVersion\(\)/);
+  assert.match(clientSource, /resolve\(this\.options\.bundledPath, "\.\.\/\.\.\/\.\.\/app\.asar"\)/);
+});
+
+test("the placeholder fallback model resolves instead of dying", () => {
+  assert.match(source, /const FALLBACK_MODEL_ID = "zcode-agent"/);
+  assert.match(source, /if \(id !== FALLBACK_MODEL_ID\) throw new Error\(`unknown zcode model: \$\{id\}`\)/);
+  assert.match(source, /modelRefOf\(cfg\.model\) \?\? firstModelRef\(cfg\.provider\)/);
+  assert.match(
+    source,
+    /ZCode has no usable models\. Sign in to ZCode Desktop \(Start Plan\) or configure an API-key provider/,
+  );
+});
+
+test("compaction cancellation is safe on a stale extension ctx", () => {
+  // pi invalidates every ctx getter on session dispose/reload (e.g. a
+  // pi-subagents child settling while the post-run compaction check races it).
+  // The handler must swallow that instead of surfacing an extension error.
+  const handler = source.slice(
+    source.indexOf('pi.on("session_before_compact"'),
+    source.indexOf('pi.registerCommand("zcode-probe"'),
+  );
+  assert.match(handler, /try \{/);
+  assert.match(handler, /\} catch \{\s*\n\s*return undefined;/s);
+  assert.match(handler, /ctx\.model\?\.provider !== "zcode"/);
+  assert.match(handler, /return \{ cancel: true \}/);
+});
+
+test("the captured ui ctx is only touched behind a stale guard", () => {
+  // uiCtx is captured at session_start; after a session replacement its getters
+  // throw, so the notify call must sit inside a try/catch.
+  assert.match(source, /try \{\s*\n\s*uiCtx\?\.ui\.notify\(/);
 });

@@ -93,8 +93,36 @@ const V2_CONFIG_PATH =
 const V2_SETTING_PATH =
   process.env.ZCODE_V2_SETTING ?? `${process.env.HOME ?? "~"}/.zcode/v2/setting.json`;
 const MAC_RESOURCES = "/Applications/ZCode.app/Contents/Resources";
-const MODERN_BUNDLED_PROVIDER_PATH = `${MAC_RESOURCES}/config/provider/zcode-builtin.json`;
-const LEGACY_BUNDLED_PROVIDER_PATH = `${MAC_RESOURCES}/glm/provider/zcode-builtin.json`;
+const LINUX_RESOURCES = "/opt/ZCode/resources";
+// Desktop 3.12+ (modern) ships its provider catalog under <resources>/config/provider/;
+// legacy installs keep it under <resources>/glm/provider/. Both layouts exist on
+// macOS (.app bundle) and Linux (electron-updater deb at /opt/ZCode).
+function firstExistingPath(paths: string[]): string | undefined {
+  return paths.find((p) => {
+    try {
+      return existsSync(p);
+    } catch {
+      return false;
+    }
+  });
+}
+const MODERN_BUNDLED_PROVIDER_PATH =
+  process.env.ZCODE_BUILTIN_PROVIDER_CONFIG_FILE ??
+  firstExistingPath([
+    `${MAC_RESOURCES}/config/provider/zcode-builtin.json`,
+    `${LINUX_RESOURCES}/config/provider/zcode-builtin.json`,
+  ]) ??
+  (process.platform === "darwin"
+    ? `${MAC_RESOURCES}/config/provider/zcode-builtin.json`
+    : `${LINUX_RESOURCES}/config/provider/zcode-builtin.json`);
+const LEGACY_BUNDLED_PROVIDER_PATH =
+  firstExistingPath([
+    `${MAC_RESOURCES}/glm/provider/zcode-builtin.json`,
+    `${LINUX_RESOURCES}/glm/provider/zcode-builtin.json`,
+  ]) ??
+  (process.platform === "darwin"
+    ? `${MAC_RESOURCES}/glm/provider/zcode-builtin.json`
+    : `${LINUX_RESOURCES}/glm/provider/zcode-builtin.json`);
 const EXPLICIT_BRIDGE_PROVIDER_CONFIG_PATH = process.env.ZCODE_BRIDGE_PROVIDER_CONFIG;
 // Each pi process gets an immutable path identity. Different extension
 // versions may coexist during upgrades; sharing this generated repository let
@@ -106,13 +134,14 @@ const BRIDGE_PROVIDER_CONFIG_PATH =
 // ZCode Desktop 3.12 moved its provider catalog and changed app-server model
 // materialization. Keep the old protocol as the default for custom commands
 // and older installations; the override also makes both paths testable.
+// Detected from the install layout on every platform (modern when only the
+// moved catalog exists — macOS .app and Linux /opt/ZCode alike).
 const MODERN_PROTOCOL = (() => {
   const override = process.env.ZCODE_PROTOCOL_VARIANT;
   if (override === "modern") return true;
   if (override === "legacy") return false;
   return (
     !process.env.ZCODE_SERVE_CMD &&
-    process.platform === "darwin" &&
     existsSync(MODERN_BUNDLED_PROVIDER_PATH) &&
     !existsSync(LEGACY_BUNDLED_PROVIDER_PATH)
   );
@@ -241,7 +270,25 @@ function resolveModelRef(id: string): { providerId: string; modelId: string } {
     return { providerId: selected.providerId, modelId: selected.modelId };
   }
   const slash = id.indexOf("/");
-  if (slash < 0) throw new Error(`unknown zcode model: ${id}`);
+  if (slash < 0) {
+    if (id !== FALLBACK_MODEL_ID) throw new Error(`unknown zcode model: ${id}`);
+    // The placeholder model advertised when the catalog is empty stands for the
+    // app-server's own default. Resolve it to the settings file's configured
+    // ref, else its first usable provider/model.
+    try {
+      const cfg = JSON.parse(readFileSync(SETTINGS_PATH, "utf8")) as SettingsConfig;
+      const ref = modelRefOf(cfg.model) ?? firstModelRef(cfg.provider);
+      if (ref) {
+        const i = ref.indexOf("/");
+        return { providerId: ref.slice(0, i), modelId: ref.slice(i + 1) };
+      }
+    } catch {
+      /* no/unreadable settings file -> clear error below */
+    }
+    throw new Error(
+      "ZCode has no usable models. Sign in to ZCode Desktop (Start Plan) or configure an API-key provider, then reopen /model.",
+    );
+  }
   const head = id.slice(0, slash);
   const modelId = id.slice(slash + 1);
   const cfg = JSON.parse(readFileSync(SETTINGS_PATH, "utf8")) as {
@@ -1878,7 +1925,11 @@ function streamSimple(
             typeof before === "number" && typeof after === "number"
               ? ` (${before.toLocaleString()} → ${after.toLocaleString()} tokens)`
               : "";
-          uiCtx?.ui.notify(`ZCode automatically compacted its context${counts}.`, "info");
+          try {
+            uiCtx?.ui.notify(`ZCode automatically compacted its context${counts}.`, "info");
+          } catch {
+            /* stale ctx after session replacement */
+          }
         }
 
         // Background-task status pushes (run_in_background bash etc.): track
@@ -2211,9 +2262,10 @@ function streamSimple(
   return out;
 }
 
+const FALLBACK_MODEL_ID = "zcode-agent";
 const FALLBACK_MODELS = [
   {
-    id: "zcode-agent",
+    id: FALLBACK_MODEL_ID,
     name: "ZCode Agent",
     reasoning: false,
     input: ["text"],
@@ -2276,9 +2328,18 @@ export default function (pi: ExtensionAPI) {
   // transcript is only a UI mirror and is never sent back as ZCode context.
   // Cancel every Pi compaction path while ZCode is active; the live protocol
   // listener above only reports ZCode's own completed auto-compactions.
+  //
+  // ctx property getters throw once the session's runner is invalidated
+  // (dispose/reload — e.g. a pi-subagents child settling while pi's post-run
+  // compaction check races the teardown). A stale ctx means this session is
+  // going away: never cancel compaction, never surface an extension error.
   pi.on("session_before_compact", (_event, ctx) => {
-    if (ctx.model?.provider !== "zcode") return;
-    return { cancel: true };
+    try {
+      if (ctx.model?.provider !== "zcode") return;
+      return { cancel: true };
+    } catch {
+      return undefined;
+    }
   });
 
   pi.registerCommand("zcode-probe", {
