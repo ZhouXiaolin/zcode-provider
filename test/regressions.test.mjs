@@ -83,3 +83,23 @@ test("the placeholder fallback model resolves instead of dying", () => {
     /ZCode has no usable models\. Sign in to ZCode Desktop \(Start Plan\) or configure an API-key provider/,
   );
 });
+
+test("compaction cancellation is safe on a stale extension ctx", () => {
+  // pi invalidates every ctx getter on session dispose/reload (e.g. a
+  // pi-subagents child settling while the post-run compaction check races it).
+  // The handler must swallow that instead of surfacing an extension error.
+  const handler = source.slice(
+    source.indexOf('pi.on("session_before_compact"'),
+    source.indexOf('pi.registerCommand("zcode-probe"'),
+  );
+  assert.match(handler, /try \{/);
+  assert.match(handler, /\} catch \{\s*\n\s*return undefined;/s);
+  assert.match(handler, /ctx\.model\?\.provider !== "zcode"/);
+  assert.match(handler, /return \{ cancel: true \}/);
+});
+
+test("the captured ui ctx is only touched behind a stale guard", () => {
+  // uiCtx is captured at session_start; after a session replacement its getters
+  // throw, so the notify call must sit inside a try/catch.
+  assert.match(source, /try \{\s*\n\s*uiCtx\?\.ui\.notify\(/);
+});

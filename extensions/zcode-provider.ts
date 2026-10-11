@@ -1925,7 +1925,11 @@ function streamSimple(
             typeof before === "number" && typeof after === "number"
               ? ` (${before.toLocaleString()} → ${after.toLocaleString()} tokens)`
               : "";
-          uiCtx?.ui.notify(`ZCode automatically compacted its context${counts}.`, "info");
+          try {
+            uiCtx?.ui.notify(`ZCode automatically compacted its context${counts}.`, "info");
+          } catch {
+            /* stale ctx after session replacement */
+          }
         }
 
         // Background-task status pushes (run_in_background bash etc.): track
@@ -2324,9 +2328,18 @@ export default function (pi: ExtensionAPI) {
   // transcript is only a UI mirror and is never sent back as ZCode context.
   // Cancel every Pi compaction path while ZCode is active; the live protocol
   // listener above only reports ZCode's own completed auto-compactions.
+  //
+  // ctx property getters throw once the session's runner is invalidated
+  // (dispose/reload — e.g. a pi-subagents child settling while pi's post-run
+  // compaction check races the teardown). A stale ctx means this session is
+  // going away: never cancel compaction, never surface an extension error.
   pi.on("session_before_compact", (_event, ctx) => {
-    if (ctx.model?.provider !== "zcode") return;
-    return { cancel: true };
+    try {
+      if (ctx.model?.provider !== "zcode") return;
+      return { cancel: true };
+    } catch {
+      return undefined;
+    }
   });
 
   pi.registerCommand("zcode-probe", {
